@@ -75,7 +75,10 @@ async def scrape_followers(
         storage_state=state_path,
         viewport={"width": 1280, "height": 800},
         user_agent="Mozilla/5.0 (X11; Linux x86_64)",
+        record_video_dir="/tmp/videos"
     )
+
+    await context.tracing.start(screenshots=True, snapshots=True)
 
     # Create two tabs: one for followers list, one for bio fetching
     followers_page = await context.new_page()
@@ -189,6 +192,14 @@ async def scrape_followers(
                     }
                     for idx in flags if str(idx).isdigit()
                 )
+        
+        trace_path = f"/tmp/trace-{target}.zip"
+        await context.tracing.stop(path=trace_path)
+        print(f"🎥  Trace written to {trace_path}")
+        for v in context.video_paths:
+            print("🎞️  Video at", v)
+        await context.close()
+        
         return yes_rows[:target_yes]
 
     except Exception as e:
