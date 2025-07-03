@@ -181,15 +181,14 @@ async def scrape_followers(
                     {"username": h, "bio": await get_bio(bio_page, h)}
                     for h in batch_handles
                 ]
-
-            flags  = await classify_remote([b["bio"] for b in bios], client)
-            yes_rows.extend(
-                {
-                    "username": bios[int(idx)]["username"],
-                    "url": f"https://www.instagram.com/{bios[int(idx)]['username']}/",
-                }
-                for idx in flags if str(idx).isdigit()
-            )
+                flags  = await classify_remote([b["bio"] for b in bios], client)
+                yes_rows.extend(
+                    {
+                        "username": bios[int(idx)]["username"],
+                        "url": f"https://www.instagram.com/{bios[int(idx)]['username']}/",
+                    }
+                    for idx in flags if str(idx).isdigit()
+                )
         return yes_rows[:target_yes]
 
     except Exception as e:
