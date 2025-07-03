@@ -128,7 +128,7 @@ async def scrape_followers(
                 new_total = len(seen_handles)
 
                 if new_total == previous_count:  # nothing new this pass
-                    await asyncio.sleep(10)  # short grace period
+                    await asyncio.sleep(20)  # short grace period
                     # try one more time
                     for h in await user_links.all_inner_texts():
                         h = h.strip()

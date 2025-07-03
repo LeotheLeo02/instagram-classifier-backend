@@ -1,21 +1,28 @@
+############################  Base image
 FROM python:3.11-slim
 
-# 1. basic tools
-RUN apt-get update && apt-get install -y --no-install-recommends \
+############################  1. minimal OS tooling
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
         curl ca-certificates gnupg && \
     rm -rf /var/lib/apt/lists/*
 
-# 2. python deps
+############################  2. Python deps
 WORKDIR /app
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# install your project deps + speedtest-cli in one go
+RUN pip install --no-cache-dir -r requirements.txt speedtest-cli
 
-# 3. playwright ⬇ (installs Chromium + deps ~120 MB)
+############################  3. Playwright + Chromium
 RUN playwright install --with-deps chromium
 
-# 4. copy code
+############################  4. copy source code
 COPY . .
 
-# 5. expose   (Railway respects $PORT env but we’ll default to 8000)
+############################  5. entry-point that does the speed test first
+COPY docker-entrypoint.sh /usr/local/bin/entrypoint
+RUN chmod +x /usr/local/bin/entrypoint
+
+############################  6. start
 ENV PORT=8000
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+ENTRYPOINT ["/usr/local/bin/entrypoint"]
