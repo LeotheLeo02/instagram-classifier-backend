@@ -100,7 +100,10 @@ async def scrape_followers(
     try:
 
         # -- open the target followers overlay on followers tab --
+        t0 = time.perf_counter()
         await followers_page.goto(f"https://www.instagram.com/{target}/")
+        nav_time = time.perf_counter() - t0
+        print(f"🏁 page.goto took {nav_time*1000:.0f} ms")
         await followers_page.click('a[href$="/followers/"]')
         await followers_page.wait_for_selector('div[role="dialog"]', timeout=25_000)
         dialog = followers_page.locator('div[role="dialog"]').last
