@@ -19,7 +19,7 @@ async def lifespan(app: FastAPI):
     app.state.playwright = pw
     app.state.browser   = await pw.chromium.launch(headless=True, args=["--no-sandbox"])
     # optional: cap concurrency
-    app.state.sema      = asyncio.Semaphore(int(os.getenv("MAX_CONCURRENT", 4)))
+    app.state.sema      = asyncio.Semaphore(int(os.getenv("MAX_CONCURRENT", 2)))
     print("✅   headless Chromium started.")
     
     yield
@@ -74,6 +74,10 @@ async def scrape(body: ScrapeRequest):          # ❶ ← only one parameter now
                 target_yes = body.target_yes,
                 batch_size = body.batch_size,
             )
+    except Exception:
+        import traceback, sys
+        traceback.print_exc()
+        raise
     finally:
         os.unlink(tmp.name)
 
