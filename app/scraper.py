@@ -79,16 +79,11 @@ async def scrape_followers(
     followers_page = await context.new_page()
     bio_page = await context.new_page()
     #Below is code that needs to be operated online
-    
+    await page.route("**/*", lambda r: r.abort() if r.request.resource_type in ("image","stylesheet","font") else r.continue_())
     try:
         
         # -- open the target followers overlay on followers tab --
         await followers_page.goto(f"https://www.instagram.com/{target}/")
-        await followers_page.screenshot(
-            path=f"shots/{target}_profile.png",
-            full_page=True,
-        )
-        print(f"📸  Saved screenshot → shots/{target}_profile.png")
         await followers_page.click('a[href$="/followers/"]')
         await followers_page.wait_for_selector('div[role="dialog"]', timeout=25_000)
         dialog = followers_page.locator('div[role="dialog"]').last
