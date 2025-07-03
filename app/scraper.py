@@ -79,7 +79,8 @@ async def scrape_followers(
     followers_page = await context.new_page()
     bio_page = await context.new_page()
     #Below is code that needs to be operated online
-    await page.route("**/*", lambda r: r.abort() if r.request.resource_type in ("image","stylesheet","font") else r.continue_())
+    await followers_page.route("**/*", lambda r: r.abort() if r.request.resource_type in ("image","stylesheet","font") else r.continue_())
+    await bio_page.route("**/*", lambda r: r.abort() if r.request.resource_type in ("image","stylesheet","font") else r.continue_())
     try:
         
         # -- open the target followers overlay on followers tab --
