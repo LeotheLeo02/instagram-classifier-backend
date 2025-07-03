@@ -55,44 +55,26 @@ class ScrapeResponse(BaseModel):
 ###############################################################################
 
 @app.post("/scrape", response_model=ScrapeResponse)
-async def scrape(
-    body : ScrapeRequest,
-    state_file: UploadFile | None = File(
-        None,
-        description="Alternative to state_b64: send the JSON file directly."
-    ),
-):
-    # ------------------------------------------------------------------ safety
-    if not (body.state_b64 or state_file):
-        raise HTTPException(422, "Provide either state_b64 or state_file")
+async def scrape(body: ScrapeRequest):          # ❶ ← only one parameter now
+    # ---------------------------------------------------------------- safety
+    if not body.state_b64:                      # ❷
+        raise HTTPException(422, "state_b64 is required (send cookies in base-64)")
 
     # ---------------------------------------------------------------- save tmp
-    tmp: tempfile.NamedTemporaryFile | None = None
+    tmp = tempfile.NamedTemporaryFile(suffix=".json", delete=False, dir="/tmp")
+    tmp.write(base64.b64decode(body.state_b64))
+    tmp.close()
+
     try:
-        tmp = tempfile.NamedTemporaryFile(
-            suffix=".json", delete=False, dir="/tmp"
-        )
-        if state_file:                       # binary upload
-            shutil.copyfileobj(state_file.file, tmp)
-        else:                                # base64 in JSON
-            tmp.write(base64.b64decode(body.state_b64))
-        tmp.close()                          # flush to disk
-
-        # ---------------------------------------------------------- run scrape
-        async with app.state.sema:           # respect MAX_CONCURRENT
+        async with app.state.sema:              # respect MAX_CONCURRENT
             yes_rows = await scrape_followers(
-                browser      = app.state.browser,
-                state_path   = tmp.name,
-                target       = body.target,
-                target_yes   = body.target_yes,
-                batch_size   = body.batch_size,
+                browser    = app.state.browser,
+                state_path = tmp.name,
+                target     = body.target,
+                target_yes = body.target_yes,
+                batch_size = body.batch_size,
             )
-
-    except Exception as e:
-        raise HTTPException(500, f"Scrape failed: {type(e).__name__}: {e}") from e
-
     finally:
-        if tmp:
-            os.unlink(tmp.name)
+        os.unlink(tmp.name)
 
     return ScrapeResponse(results=yes_rows)
