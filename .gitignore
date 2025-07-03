@@ -1,0 +1,10 @@
+# python
+__pycache__/
+*.pyc
+.venv/
+# playwright
+playwright/.cache/
+# editor / OS
+.idea/
+.vscode/
+.DS_Store
