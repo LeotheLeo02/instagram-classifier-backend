@@ -79,7 +79,7 @@ async def scrape_followers(
     )
 
     await context.tracing.start(screenshots=True, snapshots=True)
-
+    video_files = []
     # Create two tabs: one for followers list, one for bio fetching
     followers_page = await context.new_page()
     bio_page = await context.new_page()
@@ -192,13 +192,18 @@ async def scrape_followers(
                     }
                     for idx in flags if str(idx).isdigit()
                 )
-        
-        trace_path = f"/tmp/trace-{target}.zip"
-        await context.tracing.stop(path=trace_path)
-        print(f"🎥  Trace written to {trace_path}")
-        for v in context.video_paths:
-            print("🎞️  Video at", v)
+                
+        for p in (followers_page, bio_page):
+            await p.close()
+            video_files.append(await p.video.path())
+            
+        await context.tracing.stop(path=f"/tmp/trace-{target}.zip")
         await context.close()
+
+        print("🎥  Trace  ->", f"/tmp/trace-{target}.zip")
+        for v in video_files:
+            print("🎞️  Video ->", v)
+
         
         return yes_rows[:target_yes]
 
