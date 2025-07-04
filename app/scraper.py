@@ -83,25 +83,8 @@ async def scrape_followers(
     # Create two tabs: one for followers list, one for bio fetching
     followers_page = await context.new_page()
     bio_page = await context.new_page()
-    # Below is code that needs to be operated online
-    await followers_page.route(
-        "**/*",
-        lambda r: (
-            r.abort()
-            if r.request.resource_type in ("image", "stylesheet", "font")
-            else r.continue_()
-        ),
-    )
-    await bio_page.route(
-        "**/*",
-        lambda r: (
-            r.abort()
-            if r.request.resource_type in ("image", "stylesheet", "font")
-            else r.continue_()
-        ),
-    )
+    
     try:
-
         # -- open the target followers overlay on followers tab --
         t0 = time.perf_counter()
         await followers_page.goto(f"https://www.instagram.com/{target}/")
@@ -121,78 +104,72 @@ async def scrape_followers(
         batch_handles: list[str] = []  # fills up to `batch_size`
 
         # keep scrolling until we EITHER: (a) have enough yes's OR (b) time is up
+        idle_loops = 0
+        previous_count = 0
+
         async with httpx.AsyncClient(timeout=long_timeout) as client:
             while len(yes_rows) < target_yes:
-                # ------------- SCROLL one "page" -------------
+                # 1️⃣  Collect any handles currently visible *before* we test for growth
+                for h in await user_links.all_inner_texts():
+                    h = h.strip()
+                    if h and h not in seen_handles:
+                        seen_handles.add(h)
+                        batch_handles.append(h)
+
+                # 2️⃣  Check if we made progress
+                new_total = len(seen_handles)
+                if new_total == previous_count:
+                    idle_loops += 1
+                    if idle_loops >= 2:          # two scrolls with zero growth ⇒ stop
+                        print("No new followers after two scrolls – quitting.")
+                        break
+                else:
+                    idle_loops = 0               # reset because we *did* add something
+                previous_count = new_total
+
+                # 3️⃣  Scroll the last visible link into view
                 await user_links.nth(-1).scroll_into_view_if_needed()
                 await asyncio.sleep(1)
 
-                # -------- after we add any newly-seen handles --------------
-                new_total = len(seen_handles)
-
-                if new_total == previous_count:  # nothing new this pass
-                    await asyncio.sleep(20)  # short grace period
-                    # try one more time
-                    for h in await user_links.all_inner_texts():
-                        h = h.strip()
-                        if h and h not in seen_handles:
-                            seen_handles.add(h)
-                            batch_handles.append(h)
-
-                    if len(seen_handles) == previous_count:  # still nothing
-                        print("No new followers after two checks – stopping.")
-                        break  # bail out of the while-loop
-
-                previous_count = new_total  # update for next round
-
-                # ------------- when we have a full batch, classify it -------------
+                # 4️⃣  Batch → classify exactly as you already do
                 if len(batch_handles) >= batch_size:
-                    # fetch bios for this batch using the bio tab
                     bios = []
                     for h in batch_handles[:batch_size]:
                         try:
                             bio = await get_bio(bio_page, h)
-                            bios.append({"username": h, "bio": bio})
                         except Exception as e:
                             print(f"bio error for {h}: {e}")
-                            bios.append({"username": h, "bio": ""})
-
-                    batch_handles = batch_handles[batch_size:]  # remove processed ones
-
-                    # -------- call the remote classifier exactly for this slice --------
-                    flags = await classify_remote([b["bio"] for b in bios], client)
-                    # flags is already length-matched to bios
-
-                    # keep the winners
+                            bio = ""
+                        bios.append({"username": h, "bio": bio})
+                    batch_handles = batch_handles[batch_size:]     # trim
+                    flags = await classify_remote(
+                        [b["bio"] for b in bios], client
+                    )
                     yes_rows.extend(
                         {
                             "username": bios[int(idx)]["username"],
                             "url": f"https://www.instagram.com/{bios[int(idx)]['username']}/",
                         }
-                        for idx in flags
-                        if str(idx).isdigit()
+                        for idx in flags if str(idx).isdigit()
                     )
-
-                    print(
-                        f"✅ gathered {len(yes_rows)}/{target_yes} yes-profiles so far…"
+                    print(f"✅ gathered {len(yes_rows)}/{target_yes} so far…")
+            
+            # out of the while loop -> either enough yes's or time ran out
+            if batch_handles:  # flush leftovers
+                async with httpx.AsyncClient(timeout=long_timeout) as client:
+                    bios = [
+                        {"username": h, "bio": await get_bio(bio_page, h)}
+                        for h in batch_handles
+                    ]
+                    flags  = await classify_remote([b["bio"] for b in bios], client)
+                    yes_rows.extend(
+                        {
+                            "username": bios[int(idx)]["username"],
+                            "url": f"https://www.instagram.com/{bios[int(idx)]['username']}/",
+                        }
+                        for idx in flags if str(idx).isdigit()
                     )
-
-        # out of the while loop -> either enough yes's or time ran out
-        if batch_handles:  # flush leftovers
-            async with httpx.AsyncClient(timeout=long_timeout) as client:
-                bios = [
-                    {"username": h, "bio": await get_bio(bio_page, h)}
-                    for h in batch_handles
-                ]
-                flags  = await classify_remote([b["bio"] for b in bios], client)
-                yes_rows.extend(
-                    {
-                        "username": bios[int(idx)]["username"],
-                        "url": f"https://www.instagram.com/{bios[int(idx)]['username']}/",
-                    }
-                    for idx in flags if str(idx).isdigit()
-                )
-                
+                    
         for p in (followers_page, bio_page):
             await p.close()
             video_files.append(await p.video.path())
@@ -204,7 +181,6 @@ async def scrape_followers(
         for v in video_files:
             print("🎞️  Video ->", v)
 
-        
         return yes_rows[:target_yes]
 
     except Exception as e:

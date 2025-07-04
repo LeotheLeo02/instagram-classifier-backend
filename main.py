@@ -20,7 +20,7 @@ async def lifespan(app: FastAPI):
     app.state.browser   = await pw.chromium.launch(headless=True, args=["--no-sandbox"])
     # optional: cap concurrency
     app.state.sema      = asyncio.Semaphore(int(os.getenv("MAX_CONCURRENT", 2)))
-    print("✅   headless Chromium started.")
+    print("✅ headless Chromium started.")
     
     yield
     
