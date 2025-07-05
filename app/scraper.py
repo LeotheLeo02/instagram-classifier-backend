@@ -17,8 +17,16 @@ from typing import List, Dict
 from playwright.async_api import Browser
 import httpx, asyncio, time
 
-# Increased timeout values for more resilient scraping
-long_timeout = httpx.Timeout(connect=30.0, write=30.0, read=10000.0, pool=None)
+# ---------------------------------------------------------------------------
+# Timeout constants
+# ---------------------------------------------------------------------------
+# Timeouts for Playwright operations are in milliseconds
+PAGE_NAVIGATION_TIMEOUT_MS = 60_000  # 60 seconds
+DIALOG_SELECTOR_TIMEOUT_MS = 60_000  # 60 seconds
+FIRST_LINK_WAIT_TIMEOUT_MS = 30_000  # 30 seconds
+
+# Timeout for HTTP requests
+HTTPX_LONG_TIMEOUT = httpx.Timeout(connect=30.0, write=30.0, read=10_000.0, pool=None)
 
 
 def chunks(seq, size: int = 30):
@@ -32,7 +40,7 @@ async def classify_remote(bio_texts: list[str], client: httpx.AsyncClient) -> li
         resp = await client.post(
             "https://bio-classifier-production.up.railway.app/classify",
             json={"bios": bio_texts},
-            timeout=long_timeout,
+            timeout=HTTPX_LONG_TIMEOUT,
         )
         resp.raise_for_status()
         data = resp.json().get("results", [])
@@ -49,7 +57,10 @@ async def classify_remote(bio_texts: list[str], client: httpx.AsyncClient) -> li
 
 async def get_bio(page, username: str) -> str:
     """Return the profile bio (may be empty)."""
-    await page.goto(f"https://www.instagram.com/{username}/", timeout=60_000)  # Increased from 30_000 to 60_000 (60 seconds)
+    await page.goto(
+        f"https://www.instagram.com/{username}/",
+        timeout=PAGE_NAVIGATION_TIMEOUT_MS,
+    )  # Increased from 30_000 to 60_000 (60 seconds)
     try:
         desc = await page.get_attribute("head meta[name='description']", "content")
         if desc and " on Instagram: " in desc:
@@ -92,10 +103,16 @@ async def scrape_followers(
         nav_time = time.perf_counter() - t0
         print(f"🏁 page.goto took {nav_time*1000:.0f} ms")
         await followers_page.click('a[href$="/followers/"]')
-        await followers_page.wait_for_selector('div[role="dialog"]', timeout=60_000)  # Increased from 25_000 to 60_000 (60 seconds)
+        await followers_page.wait_for_selector(
+            'div[role="dialog"]',
+            timeout=DIALOG_SELECTOR_TIMEOUT_MS,
+        )  # Increased from 25_000 to 60_000 (60 seconds)
         dialog = followers_page.locator('div[role="dialog"]').last
         first_link = dialog.locator('a[href^="/"]').first
-        await first_link.wait_for(state="attached", timeout=30_000)  # Increased from 15_000 to 30_000 (30 seconds)
+        await first_link.wait_for(
+            state="attached",
+            timeout=FIRST_LINK_WAIT_TIMEOUT_MS,
+        )  # Increased from 15_000 to 30_000 (30 seconds)
 
         user_links = dialog.locator('a[href^="/"]')
 
@@ -108,7 +125,7 @@ async def scrape_followers(
         idle_loops = 0
         previous_count = 0
 
-        async with httpx.AsyncClient(timeout=long_timeout) as client:
+        async with httpx.AsyncClient(timeout=HTTPX_LONG_TIMEOUT) as client:
             while len(yes_rows) < target_yes:
                 # 1️⃣  Collect any handles currently visible *before* we test for growth
                 for h in await user_links.all_inner_texts():
@@ -157,7 +174,7 @@ async def scrape_followers(
             
             # out of the while loop -> either enough yes's or time ran out
             if batch_handles:  # flush leftovers
-                async with httpx.AsyncClient(timeout=long_timeout) as client:
+                async with httpx.AsyncClient(timeout=HTTPX_LONG_TIMEOUT) as client:
                     bios = [
                         {"username": h, "bio": await get_bio(bio_page, h)}
                         for h in batch_handles
