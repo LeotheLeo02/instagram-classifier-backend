@@ -17,7 +17,8 @@ from typing import List, Dict
 from playwright.async_api import Browser
 import httpx, asyncio, time
 
-long_timeout = httpx.Timeout(connect=10.0, write=10.0, read=300.0, pool=None)
+# Increased timeout values for more resilient scraping
+long_timeout = httpx.Timeout(connect=30.0, write=30.0, read=10000.0, pool=None)
 
 
 def chunks(seq, size: int = 30):
@@ -48,7 +49,7 @@ async def classify_remote(bio_texts: list[str], client: httpx.AsyncClient) -> li
 
 async def get_bio(page, username: str) -> str:
     """Return the profile bio (may be empty)."""
-    await page.goto(f"https://www.instagram.com/{username}/", timeout=30_000)
+    await page.goto(f"https://www.instagram.com/{username}/", timeout=60_000)  # Increased from 30_000 to 60_000 (60 seconds)
     try:
         desc = await page.get_attribute("head meta[name='description']", "content")
         if desc and " on Instagram: " in desc:
@@ -91,10 +92,10 @@ async def scrape_followers(
         nav_time = time.perf_counter() - t0
         print(f"🏁 page.goto took {nav_time*1000:.0f} ms")
         await followers_page.click('a[href$="/followers/"]')
-        await followers_page.wait_for_selector('div[role="dialog"]', timeout=25_000)
+        await followers_page.wait_for_selector('div[role="dialog"]', timeout=60_000)  # Increased from 25_000 to 60_000 (60 seconds)
         dialog = followers_page.locator('div[role="dialog"]').last
         first_link = dialog.locator('a[href^="/"]').first
-        await first_link.wait_for(state="attached", timeout=15_000)
+        await first_link.wait_for(state="attached", timeout=30_000)  # Increased from 15_000 to 30_000 (30 seconds)
 
         user_links = dialog.locator('a[href^="/"]')
 
