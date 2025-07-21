@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import List, Dict
 from playwright.async_api import Browser, TimeoutError as PlayTimeout
 import httpx
+import os
 
 
 from typing import List, Dict
@@ -24,6 +25,12 @@ import httpx, asyncio, time
 PAGE_NAVIGATION_TIMEOUT_MS = 60_000  # 60 seconds
 DIALOG_SELECTOR_TIMEOUT_MS = 60_000  # 60 seconds
 FIRST_LINK_WAIT_TIMEOUT_MS = 30_000  # 30 seconds
+
+# Scroll timing constants (in seconds)
+BASE_SCROLL_WAIT = 1.0  # Base wait time after each scroll
+IDLE_SCROLL_WAIT = 3.0  # Base wait time when no new followers detected
+PROGRESSIVE_WAIT = True # If True, wait time increases with each idle loop
+MAX_IDLE_LOOPS = 3      # Number of idle loops before giving up
 
 # Timeout for HTTP requests
 HTTPX_LONG_TIMEOUT = httpx.Timeout(connect=30.0, write=30.0, read=10_000.0, pool=None)
@@ -68,6 +75,34 @@ async def get_bio(page, username: str) -> str:
     except Exception:
         pass
     return ""
+
+
+async def send_notification(message: str, title: str = "Instagram Scraper"):
+    """Send push notification using Pushover."""
+    pushover_token = os.getenv("PUSHOVER_TOKEN")
+    pushover_user = os.getenv("PUSHOVER_USER")
+    
+    if not pushover_token or not pushover_user:
+        print("⚠️ Pushover credentials not configured - skipping notification")
+        return
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "https://api.pushover.net/1/messages.json",
+                data={
+                    "token": pushover_token,
+                    "user": pushover_user,
+                    "title": title,
+                    "message": message,
+                    "priority": 0,  # Normal priority
+                },
+                timeout=10.0
+            )
+            response.raise_for_status()
+            print("📱 Notification sent successfully")
+    except Exception as e:
+        print(f"❌ Failed to send notification: {e}")
 
 
 async def scrape_followers(
@@ -124,9 +159,17 @@ async def scrape_followers(
         # keep scrolling until we EITHER: (a) have enough yes's OR (b) time is up
         idle_loops = 0
         previous_count = 0
+        start_time = time.perf_counter()
+        timeout_seconds = 3600  # Cloud Run timeout is 3600 seconds
 
         async with httpx.AsyncClient(timeout=HTTPX_LONG_TIMEOUT) as client:
             while len(yes_rows) < target_yes:
+                # Check if we're approaching timeout (leave 30 seconds buffer for cleanup)
+                elapsed_time = time.perf_counter() - start_time
+                if elapsed_time > (timeout_seconds - 30):
+                    print(f"⏰ Timeout approaching ({elapsed_time:.1f}s elapsed, {timeout_seconds}s limit). Returning partial results.")
+                    break
+                
                 # 1️⃣  Collect any handles currently visible *before* we test for growth
                 for h in await user_links.all_inner_texts():
                     h = h.strip()
@@ -138,8 +181,8 @@ async def scrape_followers(
                 new_total = len(seen_handles)
                 if new_total == previous_count:
                     idle_loops += 1
-                    if idle_loops >= 2:          # two scrolls with zero growth ⇒ stop
-                        print("No new followers after two scrolls – quitting.")
+                    if idle_loops >= MAX_IDLE_LOOPS:          # three scrolls with zero growth ⇒ stop
+                        print(f"No new followers after {MAX_IDLE_LOOPS} scrolls – quitting.")
                         break
                 else:
                     idle_loops = 0               # reset because we *did* add something
@@ -147,7 +190,18 @@ async def scrape_followers(
 
                 # 3️⃣  Scroll the last visible link into view
                 await user_links.nth(-1).scroll_into_view_if_needed()
-                await asyncio.sleep(1)
+                
+                # Dynamic wait time: longer when idle, shorter when making progress
+                if idle_loops > 0:
+                    if PROGRESSIVE_WAIT:
+                        # Progressive wait: 3s, 5s, 7s for idle loops 1, 2, 3
+                        wait_time = IDLE_SCROLL_WAIT + (idle_loops - 1) * 2
+                    else:
+                        wait_time = IDLE_SCROLL_WAIT
+                    print(f"⏳ Idle loop {idle_loops}/{MAX_IDLE_LOOPS}, waiting {wait_time}s...")
+                else:
+                    wait_time = BASE_SCROLL_WAIT
+                await asyncio.sleep(wait_time)
 
                 # 4️⃣  Batch → classify exactly as you already do
                 if len(batch_handles) >= batch_size:
@@ -199,7 +253,24 @@ async def scrape_followers(
         for v in video_files:
             print("🎞️  Video ->", v)
 
-        return yes_rows[:target_yes]
+        # Check if we got partial results due to timeout
+        elapsed_time = time.perf_counter() - start_time
+        if len(yes_rows) < target_yes and elapsed_time >= (timeout_seconds - 30):
+            print(f"⚠️ Returning partial results: {len(yes_rows)}/{target_yes} (timeout reached after {elapsed_time:.1f}s)")
+            # Send notification about partial results
+            await send_notification(
+                f"Partial results: {len(yes_rows)}/{target_yes} followers found for @{target}",
+                f"Instagram Scraper - Partial Results"
+            )
+            return yes_rows
+        else:
+            print(f"✅ Completed successfully: {len(yes_rows)}/{target_yes} results in {elapsed_time:.1f}s")
+            # Send notification about successful completion
+            await send_notification(
+                f"Successfully found {len(yes_rows)}/{target_yes} followers for @{target} in {elapsed_time:.1f}s",
+                f"Instagram Scraper - Complete"
+            )
+            return yes_rows[:target_yes]
 
     except Exception as e:
         # Capture the page state on failure
@@ -208,6 +279,11 @@ async def scrape_followers(
         )
         print(
             f"❌ Error during scrape: {e}. Screenshot saved to shots/error_{target}.png"
+        )
+        # Send notification about failure
+        await send_notification(
+            f"Scraping failed for @{target}: {str(e)[:100]}...",
+            f"Instagram Scraper - Error"
         )
         raise
     finally:

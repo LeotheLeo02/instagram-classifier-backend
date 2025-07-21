@@ -3,7 +3,7 @@
 import base64, os, tempfile, asyncio, json, shutil
 from typing import List
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from playwright.async_api import async_playwright, Browser
 from app.scraper import scrape_followers     # ← your helper from app/scraper.py
@@ -21,6 +21,7 @@ async def lifespan(app: FastAPI):
     # optional: cap concurrency
     app.state.sema      = asyncio.Semaphore(int(os.getenv("MAX_CONCURRENT", 2)))
     print("✅ headless Chromium started.")
+    print("Lets go!")
     
     yield
     
@@ -67,6 +68,7 @@ async def scrape(body: ScrapeRequest):          # ❶ ← only one parameter now
 
     try:
         async with app.state.sema:              # respect MAX_CONCURRENT
+            print(f"🔍 starting scrape for target={body.target}, desired_yes={body.target_yes}")
             yes_rows = await scrape_followers(
                 browser    = app.state.browser,
                 state_path = tmp.name,
@@ -80,5 +82,5 @@ async def scrape(body: ScrapeRequest):          # ❶ ← only one parameter now
         raise
     finally:
         os.unlink(tmp.name)
-
     return ScrapeResponse(results=yes_rows)
+
