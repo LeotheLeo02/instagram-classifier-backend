@@ -25,6 +25,9 @@ import httpx, asyncio, time
 PAGE_NAVIGATION_TIMEOUT_MS = 60_000  # 60 seconds
 DIALOG_SELECTOR_TIMEOUT_MS = 60_000  # 60 seconds
 FIRST_LINK_WAIT_TIMEOUT_MS = 30_000  # 30 seconds
+# NEW: much shorter timeout for per-profile bio page loads – we don’t
+#      want a single problematic profile to block the run for a minute
+BIO_PAGE_TIMEOUT_MS = 10_000        # 10 seconds
 
 # Scroll timing constants (in seconds)
 BASE_SCROLL_WAIT = 1.0  # Base wait time after each scroll
@@ -63,11 +66,26 @@ async def classify_remote(bio_texts: list[str], client: httpx.AsyncClient) -> li
 
 
 async def get_bio(page, username: str) -> str:
-    """Return the profile bio (may be empty)."""
-    await page.goto(
-        f"https://www.instagram.com/{username}/",
-        timeout=PAGE_NAVIGATION_TIMEOUT_MS,
-    )  # Increased from 30_000 to 60_000 (60 seconds)
+    """Return the profile bio (may be empty).
+    
+    A dedicated (shorter) timeout is used so that profiles that fail to load
+    don’t freeze the whole scraping loop for the default Playwright timeout
+    (60 s). If the navigation hits that timeout (or any other error), we
+    immediately return an empty string so the caller can continue.
+    """
+    try:
+        await page.goto(
+            f"https://www.instagram.com/{username}/",
+            timeout=BIO_PAGE_TIMEOUT_MS,
+            wait_until="domcontentloaded",  # Don’t wait for all network requests
+        )
+    except PlayTimeout:
+        # Profile failed to load within BIO_PAGE_TIMEOUT_MS – skip it quickly.
+        return ""
+    except Exception:
+        # Any other unexpected error while navigating → skip
+        return ""
+
     try:
         desc = await page.get_attribute("head meta[name='description']", "content")
         if desc and " on Instagram: " in desc:
