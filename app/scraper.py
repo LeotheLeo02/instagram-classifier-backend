@@ -265,7 +265,6 @@ async def scrape_followers(
             video_files.append(await p.video.path())
             
         await context.tracing.stop(path=f"/tmp/trace-{target}.zip")
-        await context.close()
 
         print("🎥  Trace  ->", f"/tmp/trace-{target}.zip")
         for v in video_files:
