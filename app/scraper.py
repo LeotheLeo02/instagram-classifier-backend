@@ -33,7 +33,7 @@ BIO_PAGE_TIMEOUT_MS = 10_000        # 10 seconds
 BASE_SCROLL_WAIT = 1.0  # Base wait time after each scroll
 IDLE_SCROLL_WAIT = 3.0  # Base wait time when no new followers detected
 PROGRESSIVE_WAIT = True # If True, wait time increases with each idle loop
-MAX_IDLE_LOOPS = 3      # Number of idle loops before giving up
+MAX_IDLE_LOOPS = 5      # Number of idle loops before giving up (was 3)
 
 # Timeout for HTTP requests
 HTTPX_LONG_TIMEOUT = httpx.Timeout(connect=30.0, write=30.0, read=10_000.0, pool=None)
