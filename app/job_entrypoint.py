@@ -30,10 +30,18 @@ async def main() -> None:
         browser = await pw.chromium.launch(headless=True, args=["--no-sandbox"])
 
         state_gcs_uri = os.environ["STATE_GCS_URI"]
-        target      = os.environ["TARGET"]
-        yes         = int(os.getenv("TARGET_YES", 10))
-        batch_size  = int(os.getenv("BATCH_SIZE", 30))
+        target       = os.environ["TARGET"]
+        yes          = int(os.getenv("TARGET_YES", 10))
+        batch_size   = int(os.getenv("BATCH_SIZE", 30))
+
+        print(f"STATE_GCS_URI={state_gcs_uri}", flush=True)
+        print(f"TARGET={target}", flush=True)
+        print(f"TARGET_YES={yes}", flush=True)
+        print(f"BATCH_SIZE={batch_size}", flush=True)
+
         state_path = Path(_download_state_from_gcs(state_gcs_uri))
+
+        print("Starting scrape_followers", flush=True)
 
         results = await scrape_followers(
             browser     = browser,
@@ -43,7 +51,9 @@ async def main() -> None:
             batch_size  = batch_size,
         )
 
-        print(json.dumps(results, indent=2))
+        print("scrape_followers finished", flush=True)
+
+        print(json.dumps(results, indent=2), flush=True)
 
 if __name__ == "__main__":
     asyncio.run(main())
