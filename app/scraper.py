@@ -79,7 +79,7 @@ def get_random_fingerprint():
 async def classify_remote(bio_texts: list[str], client: httpx.AsyncClient) -> list[str]:
     try:
         resp = await client.post(
-            "https://bio-classifier-production.up.railway.app/classify",
+            "https://bio-classifier-672383441505.us-central1.run.app/classify",
             json={"bios": bio_texts},
             timeout=HTTPX_LONG_TIMEOUT,
         )
