@@ -76,12 +76,6 @@ def get_random_fingerprint():
     return random.choice(BROWSER_FINGERPRINTS)
 
 
-async def human_sleep(base: float, spread: float = 0.5):
-    """Human-like sleep with randomization."""
-    sleep_time = base + random.uniform(0, spread)
-    await asyncio.sleep(sleep_time)
-
-
 async def classify_remote(bio_texts: list[str], client: httpx.AsyncClient) -> list[str]:
     try:
         resp = await client.post(
@@ -112,7 +106,6 @@ async def get_bio(page, username: str) -> str:
     """
     try:
         # Small random delay before navigation
-        await human_sleep(0.5, 1.0)
         
         await page.goto(
             f"https://www.instagram.com/{username}/",
@@ -138,7 +131,6 @@ async def get_bio(page, username: str) -> str:
                 raise RuntimeError("CAPTCHA or challenge detected")
         
         # Small random delay after navigation
-        await human_sleep(0.3, 0.7)
         
     except PlayTimeout:
         # Profile failed to load within BIO_PAGE_TIMEOUT_MS – skip it quickly.
@@ -248,7 +240,7 @@ async def scrape_followers(
         print(f"🏁 page.goto took {nav_time*1000:.0f} ms")
         
         # Small delay before clicking followers
-        await human_sleep(1.0, 2.0)
+        
         await followers_page.click('a[href$="/followers/"]')
         await followers_page.wait_for_selector(
             'div[role="dialog"]',
@@ -321,7 +313,6 @@ async def scrape_followers(
                     try:
                         for h in batch_handles[:batch_size]:
                             # Small delay between bio requests for stealth
-                            await human_sleep(0.5, 1.0)
                             bio = await get_bio(bio_page, h)
                         batch_handles = batch_handles[batch_size:]     # trim
                         flags = await classify_remote(
