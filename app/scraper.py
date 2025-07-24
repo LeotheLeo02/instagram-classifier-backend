@@ -228,9 +228,6 @@ async def scrape_followers(
         await stealth_async(followers_page)
         await stealth_async(bio_page)
     
-    # Block unnecessary resources for faster loading
-    await followers_page.route("**/*.{png,jpg,jpeg,gif,svg,woff,woff2,ttf}", lambda r: r.abort())
-    await bio_page.route("**/*.{png,jpg,jpeg,gif,svg,woff,woff2,ttf}", lambda r: r.abort())
     
     try:
         # -- open the target followers overlay on followers tab --
