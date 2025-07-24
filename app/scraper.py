@@ -7,16 +7,20 @@ Reusable Playwright helper for:
 """
 
 import asyncio
+import random
 from pathlib import Path
 from typing import List, Dict
 from playwright.async_api import Browser, TimeoutError as PlayTimeout
 import httpx
 import os
+import time
 
-
-from typing import List, Dict
-from playwright.async_api import Browser
-import httpx, asyncio, time
+# Try to import playwright-stealth for enhanced anti-detection
+try:
+    from playwright_stealth import stealth_async
+    STEALTH_AVAILABLE = True
+except ImportError:
+    STEALTH_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Timeout constants
@@ -35,6 +39,28 @@ IDLE_SCROLL_WAIT = 3.0  # Base wait time when no new followers detected
 PROGRESSIVE_WAIT = True # If True, wait time increases with each idle loop
 MAX_IDLE_LOOPS = 5      # Number of idle loops before giving up (was 3)
 
+# Stealth configuration
+BROWSER_FINGERPRINTS = [
+    {
+        "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "viewport": {"width": 1280, "height": 800},
+        "locale": "en-US",
+        "timezone_id": "America/New_York"
+    },
+    {
+        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "viewport": {"width": 1366, "height": 768},
+        "locale": "en-US",
+        "timezone_id": "America/Los_Angeles"
+    },
+    {
+        "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "viewport": {"width": 1200, "height": 800},
+        "locale": "en-US",
+        "timezone_id": "Europe/London"
+    }
+]
+
 # Timeout for HTTP requests
 HTTPX_LONG_TIMEOUT = httpx.Timeout(connect=30.0, write=30.0, read=10_000.0, pool=None)
 
@@ -43,6 +69,17 @@ def chunks(seq, size: int = 30):
     """Yield successive `size`-sized slices from seq."""
     for i in range(0, len(seq), size):
         yield seq[i : i + size]
+
+
+def get_random_fingerprint():
+    """Get a random browser fingerprint for anti-detection."""
+    return random.choice(BROWSER_FINGERPRINTS)
+
+
+async def human_sleep(base: float, spread: float = 0.5):
+    """Human-like sleep with randomization."""
+    sleep_time = base + random.uniform(0, spread)
+    await asyncio.sleep(sleep_time)
 
 
 async def classify_remote(bio_texts: list[str], client: httpx.AsyncClient) -> list[str]:
@@ -66,19 +103,43 @@ async def classify_remote(bio_texts: list[str], client: httpx.AsyncClient) -> li
 
 
 async def get_bio(page, username: str) -> str:
-    """Return the profile bio (may be empty).
+    """Return the profile bio (may be empty) with stealth measures.
     
     A dedicated (shorter) timeout is used so that profiles that fail to load
-    don’t freeze the whole scraping loop for the default Playwright timeout
+    don't freeze the whole scraping loop for the default Playwright timeout
     (60 s). If the navigation hits that timeout (or any other error), we
     immediately return an empty string so the caller can continue.
     """
     try:
+        # Small random delay before navigation
+        await human_sleep(0.5, 1.0)
+        
         await page.goto(
             f"https://www.instagram.com/{username}/",
             timeout=BIO_PAGE_TIMEOUT_MS,
-            wait_until="domcontentloaded",  # Don’t wait for all network requests
+            wait_until="domcontentloaded",  # Don't wait for all network requests
         )
+        
+        # Check for security challenges
+        challenge_indicators = [
+            'text="Help us confirm it\'s you"',
+            'text="challenge"',
+            'text="unusual activity"',
+            'text="temporarily restricted"',
+            'text="reCAPTCHA"',
+            'text="Something went wrong"',
+            'text="Page not found"',
+            '[data-testid="challenge-page"]'
+        ]
+        
+        for indicator in challenge_indicators:
+            if await page.locator(indicator).count() > 0:
+                print(f"❌ CAPTCHA or challenge detected for {username} – aborting scraping.")
+                raise RuntimeError("CAPTCHA or challenge detected")
+        
+        # Small random delay after navigation
+        await human_sleep(0.3, 0.7)
+        
     except PlayTimeout:
         # Profile failed to load within BIO_PAGE_TIMEOUT_MS – skip it quickly.
         return ""
@@ -136,12 +197,33 @@ async def scrape_followers(
     returns a list of {'username': str, 'bio': str}.
     """
 
+    # Get random fingerprint for anti-detection
+    fingerprint = get_random_fingerprint()
+    
     context = await browser.new_context(
         storage_state=state_path,
-        viewport={"width": 1280, "height": 800},
-        user_agent="Mozilla/5.0 (X11; Linux x86_64)",
-        record_video_dir="/tmp/videos"
+        viewport=fingerprint["viewport"],
+        user_agent=fingerprint["user_agent"],
+        locale=fingerprint["locale"],
+        timezone_id=fingerprint["timezone_id"],
+        record_video_dir="/tmp/videos",
+        extra_http_headers={
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": f"{fingerprint['locale']},{fingerprint['locale'].split('-')[0]};q=0.5",
+            "Accept-Encoding": "gzip, deflate, br",
+            "DNT": "1",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+        }
     )
+    
+    # Add stealth scripts to hide automation
+    await context.add_init_script("""
+        // Hide automation flags
+        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+        Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+        Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+    """)
 
     await context.tracing.start(screenshots=True, snapshots=True)
     video_files = []
@@ -149,12 +231,24 @@ async def scrape_followers(
     followers_page = await context.new_page()
     bio_page = await context.new_page()
     
+    # Apply stealth measures if available
+    if STEALTH_AVAILABLE:
+        await stealth_async(followers_page)
+        await stealth_async(bio_page)
+    
+    # Block unnecessary resources for faster loading
+    await followers_page.route("**/*.{png,jpg,jpeg,gif,svg,woff,woff2,ttf}", lambda r: r.abort())
+    await bio_page.route("**/*.{png,jpg,jpeg,gif,svg,woff,woff2,ttf}", lambda r: r.abort())
+    
     try:
         # -- open the target followers overlay on followers tab --
         t0 = time.perf_counter()
         await followers_page.goto(f"https://www.instagram.com/{target}/")
         nav_time = time.perf_counter() - t0
         print(f"🏁 page.goto took {nav_time*1000:.0f} ms")
+        
+        # Small delay before clicking followers
+        await human_sleep(1.0, 2.0)
         await followers_page.click('a[href$="/followers/"]')
         await followers_page.wait_for_selector(
             'div[role="dialog"]',
@@ -224,25 +318,27 @@ async def scrape_followers(
                 # 4️⃣  Batch → classify exactly as you already do
                 if len(batch_handles) >= batch_size:
                     bios = []
-                    for h in batch_handles[:batch_size]:
-                        try:
+                    try:
+                        for h in batch_handles[:batch_size]:
+                            # Small delay between bio requests for stealth
+                            await human_sleep(0.5, 1.0)
                             bio = await get_bio(bio_page, h)
-                        except Exception as e:
-                            print(f"bio error for {h}: {e}")
-                            bio = ""
-                        bios.append({"username": h, "bio": bio})
-                    batch_handles = batch_handles[batch_size:]     # trim
-                    flags = await classify_remote(
-                        [b["bio"] for b in bios], client
-                    )
-                    yes_rows.extend(
-                        {
-                            "username": bios[int(idx)]["username"],
-                            "url": f"https://www.instagram.com/{bios[int(idx)]['username']}/",
-                        }
-                        for idx in flags if str(idx).isdigit()
-                    )
-                    print(f"✅ gathered {len(yes_rows)}/{target_yes} so far…")
+                        batch_handles = batch_handles[batch_size:]     # trim
+                        flags = await classify_remote(
+                            [b["bio"] for b in bios], client
+                        )
+                        yes_rows.extend(
+                            {
+                                "username": bios[int(idx)]["username"],
+                                "url": f"https://www.instagram.com/{bios[int(idx)]['username']}/",
+                            }
+                            for idx in flags if str(idx).isdigit()
+                        )
+                        print(f"✅ gathered {len(yes_rows)}/{target_yes} so far…")
+                    except RuntimeError as e:
+                        print(str(e))
+                        print("🛑 Aborting scraping due to challenge.")
+                        break
             
             # out of the while loop -> either enough yes's or time ran out
             if batch_handles:  # flush leftovers
