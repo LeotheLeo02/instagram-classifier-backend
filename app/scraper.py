@@ -10,6 +10,7 @@ import asyncio
 from google.cloud import storage
 from pathlib import Path
 from typing import List, Dict
+# Playwright timeout error is used in a few places; import it explicitly
 from playwright.async_api import Browser, TimeoutError as PlayTimeout
 import httpx
 import os
@@ -240,6 +241,7 @@ async def scrape_followers(
         start_time = time.perf_counter()
         timeout_seconds = 3600  # Cloud Run timeout is 3600 seconds
 
+        scroll_timeout = False
         async with httpx.AsyncClient(timeout=HTTPX_LONG_TIMEOUT) as client:
             while len(yes_rows) < target_yes:
                 # Check if we're approaching timeout (leave 30 seconds buffer for cleanup)
@@ -267,7 +269,12 @@ async def scrape_followers(
                 previous_count = new_total
 
                 # 3️⃣  Scroll the last visible link into view
-                await user_links.nth(-1).scroll_into_view_if_needed()
+                try:
+                    await user_links.nth(-1).scroll_into_view_if_needed()
+                except PlayTimeout:
+                    print("⚠️ Scroll timeout encountered – likely end of list.")
+                    scroll_timeout = True
+                    break
                 
                 # Dynamic wait time: longer when idle, shorter when making progress
                 if idle_loops > 0:
@@ -338,9 +345,18 @@ async def scrape_followers(
         for v in video_files:
             print("🎞️  Video ->", v)
 
-        # Check if we got partial results due to timeout
+        # Check if we got partial results due to scrolling or timeout
         elapsed_time = time.perf_counter() - start_time
-        if len(yes_rows) < target_yes and elapsed_time >= (timeout_seconds - 30):
+        if scroll_timeout:
+            print(
+                f"⚠️ Returning partial results: {len(yes_rows)}/{target_yes} (scroll timeout)"
+            )
+            await send_notification(
+                f"Partial results: {len(yes_rows)}/{target_yes} followers found for @{target} (scroll timeout)",
+                "Instagram Scraper - Partial Results",
+            )
+            return yes_rows
+        elif len(yes_rows) < target_yes and elapsed_time >= (timeout_seconds - 30):
             print(f"⚠️ Returning partial results: {len(yes_rows)}/{target_yes} (timeout reached after {elapsed_time:.1f}s)")
             # Send notification about partial results
             await send_notification(
@@ -355,7 +371,7 @@ async def scrape_followers(
                 f"Successfully found {len(yes_rows)}/{target_yes} followers for @{target} in {elapsed_time:.1f}s",
                 f"Instagram Scraper - Complete"
             )
-            return yes_rows[:target_yes]
+            return yes_rows
 
     except Exception as e:
         # Capture the page state on failure
