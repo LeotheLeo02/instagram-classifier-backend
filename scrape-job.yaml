@@ -1,0 +1,64 @@
+apiVersion: run.googleapis.com/v1
+kind: Job
+metadata:
+  annotations:
+    run.googleapis.com/client-name: cloud-console
+    run.googleapis.com/creator: lockintheknowledge@gmail.com
+    run.googleapis.com/lastModifier: lockintheknowledge@gmail.com
+    run.googleapis.com/operation-id: e9d9f1fb-4491-44bd-ac7c-f1653e05afe4
+  creationTimestamp: '2025-07-07T22:11:02.836474Z'
+  generation: 37
+  labels:
+    cloud.googleapis.com/location: europe-west1
+    run.googleapis.com/lastUpdatedTime: '2025-07-25T06:34:21.294839Z'
+  name: scrape-job
+  namespace: '672383441505'
+  resourceVersion: AAY6uyTOmdI
+  selfLink: /apis/run.googleapis.com/v1/namespaces/672383441505/jobs/scrape-job
+  uid: 5a6c0810-84f2-4078-a643-d0dc76310edf
+spec:
+  template:
+    metadata:
+      annotations:
+        run.googleapis.com/client-name: cloud-console
+        run.googleapis.com/execution-environment: gen2
+      labels:
+        client.knative.dev/nonce: sen_ziy_hep
+    spec:
+      taskCount: 1
+      template:
+        spec:
+          containers:
+          - args:
+            - -m
+            - app.job_entrypoint
+            command:
+            - python
+            env:
+            - name: PUSHOVER_TOKEN
+              value: a1p8p3dz84safu7vcsh4emdo7nk26i
+            - name: PUSHOVER_USER
+              value: uons5rx8amqeutz9qmjh5dgtes5nke
+            - name: SCREENSHOT_BUCKET
+              value: newera-93301-screenshots
+            image: europe-west1-docker.pkg.dev/newera-93301/instagram-api/api:20250724-231327
+            name: ig-backend-1
+            resources:
+              limits:
+                cpu: 2000m
+                memory: 4Gi
+          maxRetries: 0
+          serviceAccountName: 672383441505-compute@developer.gserviceaccount.com
+          timeoutSeconds: '10800'
+status:
+  conditions:
+  - lastTransitionTime: '2025-07-07T22:11:03.336295Z'
+    status: 'True'
+    type: Ready
+  executionCount: 139
+  latestCreatedExecution:
+    completionStatus: EXECUTION_FAILED
+    completionTimestamp: '2025-07-25T06:35:09.701795Z'
+    creationTimestamp: '2025-07-25T06:34:29.184962Z'
+    name: scrape-job-lz4pr
+  observedGeneration: 37

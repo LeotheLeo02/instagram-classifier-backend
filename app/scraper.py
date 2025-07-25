@@ -7,6 +7,7 @@ Reusable Playwright helper for:
 """
 
 import asyncio
+from google.cloud import storage
 from pathlib import Path
 from typing import List, Dict
 from playwright.async_api import Browser, TimeoutError as PlayTimeout
@@ -40,6 +41,22 @@ MAX_IDLE_LOOPS = 5      # Number of idle loops before giving up (was 3)
 
 # Timeout for HTTP requests
 HTTPX_LONG_TIMEOUT = httpx.Timeout(connect=30.0, write=30.0, read=10_000.0, pool=None)
+
+GCS_BUCKET = os.getenv("SCREENSHOT_BUCKET")
+
+
+def upload_to_gcs(local_path: str, destination_blob: str) -> None:
+    """
+    Upload a local file to GCS.
+      - local_path:  path on disk, e.g. "shots/no_link.png"
+      - destination_blob: path in bucket, e.g. "shots/no_link.png"
+    """
+    client = storage.Client()  # uses default credentials from Cloud Run
+    bucket = client.bucket(GCS_BUCKET)
+    blob   = bucket.blob(destination_blob)
+    blob.upload_from_filename(local_path)
+    print(f"✅ Screenshot uploaded to gs://{GCS_BUCKET}/{destination_blob}")
+
 
 
 def chunks(seq, size: int = 30):
@@ -165,27 +182,10 @@ async def scrape_followers(
     context = await browser.new_context(
         storage_state=state_path,
         viewport={"width": 1280, "height": 800},
-        user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        locale="en-US",
-        timezone_id="America/New_York",
-        extra_http_headers={
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
-            "Accept-Encoding": "gzip, deflate, br",
-            "DNT": "1",
-            "Connection": "keep-alive",
-            "Upgrade-Insecure-Requests": "1",
-        }
+        user_agent="Mozilla/5.0 (X11; Linux x86_64)",
+        record_video_dir="videos/"
     )
     
-    # Add stealth scripts to hide automation
-    await context.add_init_script("""
-        // Hide automation flags
-        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-        Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-        Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
-    """)
-
     await context.tracing.start(screenshots=True, snapshots=True)
     video_files = []
     # Create two tabs: one for followers list, one for bio fetching
@@ -206,22 +206,16 @@ async def scrape_followers(
         print(f"🏁 page.goto took {nav_time*1000:.0f} ms")
         
         
-        link = followers_page.locator('a[href$="/followers"], a[href$="followers"]')
-        cnt = await link.count()
-        print(f"🔍 locator count: {cnt}")
+            # 1) Use a more tolerant locator
+        link = followers_page.locator('header a[href*="/followers"]')
 
-        if cnt == 0:
-            await followers_page.screenshot(path="no_link.png", full_page=True)
-            raise RuntimeError("followers link not found – see no_link.png")
+        # 2) Give Playwright a generous default so every locator inherits it
+        followers_page.set_default_timeout(25_000)       # 25 s
 
-        try:
-            await link.first.wait_for(state="visible", timeout=8_000)
-            print("✅ link visible, clicking…")
-            await link.first.click()
-        except TimeoutError:
-            print("❌ link never became visible")
-            await followers_page.screenshot(path="not_visible.png", full_page=True)
-            raise
+        # 3) Wait for *existence* first, then for visibility, then click
+        await followers_page.wait_for_selector('header a[href*="/followers"]', state="attached")
+        await link.wait_for(state="visible")              # respects default timeout
+        await link.click()
         await followers_page.wait_for_selector(
             'div[role="dialog"]',
             timeout=DIALOG_SELECTOR_TIMEOUT_MS,
@@ -371,10 +365,20 @@ async def scrape_followers(
         print(
             f"❌ Error during scrape: {e}. Screenshot saved to shots/error_{target}.png"
         )
-        html = await followers_page.content()
-        print("📝 PAGE HTML DUMP ↓↓↓")
-        print(html)
-        print("📝 PAGE HTML DUMP ↑↑↑")
+        os.makedirs("shots", exist_ok=True)
+        not_visible_path = "shots/not_visible.png"
+        await followers_page.screenshot(path=not_visible_path, full_page=True)
+        upload_to_gcs(local_path=not_visible_path, destination_blob=not_visible_path)
+        # Finalize and upload video files
+        await context.close()
+        for p in (followers_page, bio_page):
+            try:
+                await p.close()
+                video_path = await p.video.path()
+                if video_path:
+                    upload_to_gcs(local_path=video_path, destination_blob=f"videos/{os.path.basename(video_path)}")
+            except Exception as ve:
+                print(f"⚠️ Could not upload video: {ve}")
         # Send notification about failure
         await send_notification(
             f"Scraping failed for @{target}: {str(e)[:100]}...",
