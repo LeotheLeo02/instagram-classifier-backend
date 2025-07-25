@@ -7,7 +7,6 @@ Reusable Playwright helper for:
 """
 
 import asyncio
-import random
 from pathlib import Path
 from typing import List, Dict
 from playwright.async_api import Browser, TimeoutError as PlayTimeout
@@ -207,7 +206,22 @@ async def scrape_followers(
         print(f"🏁 page.goto took {nav_time*1000:.0f} ms")
         
         
-        await followers_page.click('a[href$="/followers/"]')
+        link = followers_page.locator('a[href$="/followers"], a[href$="followers"]')
+        cnt = await link.count()
+        print(f"🔍 locator count: {cnt}")
+
+        if cnt == 0:
+            await followers_page.screenshot(path="no_link.png", full_page=True)
+            raise RuntimeError("followers link not found – see no_link.png")
+
+        try:
+            await link.first.wait_for(state="visible", timeout=8_000)
+            print("✅ link visible, clicking…")
+            await link.first.click()
+        except TimeoutError:
+            print("❌ link never became visible")
+            await followers_page.screenshot(path="not_visible.png", full_page=True)
+            raise
         await followers_page.wait_for_selector(
             'div[role="dialog"]',
             timeout=DIALOG_SELECTOR_TIMEOUT_MS,
