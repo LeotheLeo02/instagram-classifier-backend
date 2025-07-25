@@ -181,7 +181,7 @@ async def scrape_followers(
     state_path: Path,
     target: str,
     target_yes: int = 10,
-    batch_size: int = 30,
+    batch_size: int = 20,
 ) -> List[Dict]:
     """
     Reuses a running `browser` (passed from FastAPI lifespan),
@@ -236,7 +236,6 @@ async def scrape_followers(
         nav_time = time.perf_counter() - t0
         print(f"🏁 page.goto took {nav_time*1000:.0f} ms")
         
-        # Small delay before clicking followers
         
         await followers_page.click('a[href$="/followers/"]')
         await followers_page.wait_for_selector(
@@ -309,19 +308,24 @@ async def scrape_followers(
                     bios = []
                     try:
                         for h in batch_handles[:batch_size]:
-                            # Small delay between bio requests for stealth
                             bio = await get_bio(bio_page, h)
+                            if bio or bio == "":  # Include even empty bios to maintain index alignment
+                                bios.append({"username": h, "bio": bio})
+
                         batch_handles = batch_handles[batch_size:]     # trim
+
                         flags = await classify_remote(
                             [b["bio"] for b in bios], client
                         )
-                        yes_rows.extend(
-                            {
-                                "username": bios[int(idx)]["username"],
-                                "url": f"https://www.instagram.com/{bios[int(idx)]['username']}/",
-                            }
-                            for idx in flags if str(idx).isdigit()
-                        )
+                        yes_idx = {int(f) for f in flags if f.isdigit()}
+                        for idx in yes_idx:
+                            if bios[idx]["bio"]:            # make sure bio isn’t empty
+                                yes_rows.append({
+                                    "username": bios[idx]["username"],
+                                    "url": f"https://www.instagram.com/{bios[idx]['username']}/",
+                                    "bio": bios[idx]["bio"]
+                                })
+
                         print(f"✅ gathered {len(yes_rows)}/{target_yes} so far…")
                     except RuntimeError as e:
                         print(str(e))
@@ -335,14 +339,16 @@ async def scrape_followers(
                         {"username": h, "bio": await get_bio(bio_page, h)}
                         for h in batch_handles
                     ]
-                    flags  = await classify_remote([b["bio"] for b in bios], client)
-                    yes_rows.extend(
-                        {
-                            "username": bios[int(idx)]["username"],
-                            "url": f"https://www.instagram.com/{bios[int(idx)]['username']}/",
-                        }
-                        for idx in flags if str(idx).isdigit()
-                    )
+                    flags = await classify_remote([b["bio"] for b in bios], client)
+                    yes_idx = {int(f) for f in flags if f.isdigit()}
+                        # Add "yes" results
+                    for idx in yes_idx:
+                        if bios[idx]["bio"]:            # make sure bio isn’t empty
+                            yes_rows.append({
+                                "username": bios[idx]["username"],
+                                "url": f"https://www.instagram.com/{bios[idx]['username']}/",
+                                "bio": bios[idx]["bio"]
+                            })
                     
         for p in (followers_page, bio_page):
             await p.close()
@@ -381,6 +387,10 @@ async def scrape_followers(
         print(
             f"❌ Error during scrape: {e}. Screenshot saved to shots/error_{target}.png"
         )
+        html = await followers_page.content()
+        print("📝 PAGE HTML DUMP ↓↓↓")
+        print(html)
+        print("📝 PAGE HTML DUMP ↑↑↑")
         # Send notification about failure
         await send_notification(
             f"Scraping failed for @{target}: {str(e)[:100]}...",
