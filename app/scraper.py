@@ -39,28 +39,6 @@ IDLE_SCROLL_WAIT = 3.0  # Base wait time when no new followers detected
 PROGRESSIVE_WAIT = True # If True, wait time increases with each idle loop
 MAX_IDLE_LOOPS = 5      # Number of idle loops before giving up (was 3)
 
-# Stealth configuration
-BROWSER_FINGERPRINTS = [
-    {
-        "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "viewport": {"width": 1280, "height": 800},
-        "locale": "en-US",
-        "timezone_id": "America/New_York"
-    },
-    {
-        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "viewport": {"width": 1366, "height": 768},
-        "locale": "en-US",
-        "timezone_id": "America/Los_Angeles"
-    },
-    {
-        "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "viewport": {"width": 1200, "height": 800},
-        "locale": "en-US",
-        "timezone_id": "Europe/London"
-    }
-]
-
 # Timeout for HTTP requests
 HTTPX_LONG_TIMEOUT = httpx.Timeout(connect=30.0, write=30.0, read=10_000.0, pool=None)
 
@@ -70,10 +48,6 @@ def chunks(seq, size: int = 30):
     for i in range(0, len(seq), size):
         yield seq[i : i + size]
 
-
-def get_random_fingerprint():
-    """Get a random browser fingerprint for anti-detection."""
-    return random.choice(BROWSER_FINGERPRINTS)
 
 
 async def classify_remote(bio_texts: list[str], client: httpx.AsyncClient) -> list[str]:
@@ -188,20 +162,16 @@ async def scrape_followers(
     logs in with given creds (if not cached), scrolls follower list,
     returns a list of {'username': str, 'bio': str}.
     """
-
-    # Get random fingerprint for anti-detection
-    fingerprint = get_random_fingerprint()
     
     context = await browser.new_context(
         storage_state=state_path,
-        viewport=fingerprint["viewport"],
-        user_agent=fingerprint["user_agent"],
-        locale=fingerprint["locale"],
-        timezone_id=fingerprint["timezone_id"],
-        record_video_dir="/tmp/videos",
+        viewport={"width": 1280, "height": 800},
+        user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        locale="en-US",
+        timezone_id="America/New_York",
         extra_http_headers={
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-            "Accept-Language": f"{fingerprint['locale']},{fingerprint['locale'].split('-')[0]};q=0.5",
+            "Accept-Language": "en-US,en;q=0.5",
             "Accept-Encoding": "gzip, deflate, br",
             "DNT": "1",
             "Connection": "keep-alive",
