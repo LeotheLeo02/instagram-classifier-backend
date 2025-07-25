@@ -10,6 +10,7 @@ import asyncio
 from google.cloud import storage
 from pathlib import Path
 from typing import List, Dict
+# Playwright timeout error is used in a few places; import it explicitly
 from playwright.async_api import Browser, TimeoutError as PlayTimeout
 import httpx
 import os
