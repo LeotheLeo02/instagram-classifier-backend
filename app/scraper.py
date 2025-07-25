@@ -371,7 +371,7 @@ async def scrape_followers(
                 f"Successfully found {len(yes_rows)}/{target_yes} followers for @{target} in {elapsed_time:.1f}s",
                 f"Instagram Scraper - Complete"
             )
-            return yes_rows[:target_yes]
+            return yes_rows
 
     except Exception as e:
         # Capture the page state on failure
