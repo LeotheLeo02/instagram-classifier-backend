@@ -334,17 +334,6 @@ async def scrape_followers(
                                 "url": f"https://www.instagram.com/{bios[idx]['username']}/",
                                 "bio": bios[idx]["bio"]
                             })
-                    
-        for p in (followers_page, bio_page):
-            await p.close()
-            video_files.append(await p.video.path())
-            
-        await context.tracing.stop(path=f"/tmp/trace-{target}.zip")
-
-        print("🎥  Trace  ->", f"/tmp/trace-{target}.zip")
-        for v in video_files:
-            print("🎞️  Video ->", v)
-
         # Check if we got partial results due to scrolling or timeout
         elapsed_time = time.perf_counter() - start_time
         if scroll_timeout:
