@@ -41,6 +41,7 @@ class ScrapeRequest(BaseModel):
     target      : str              = Field(...,  example="utmartin")
     target_yes  : int              = Field(10,   ge=1, le=200)
     batch_size  : int              = Field(30,   ge=5, le=50)
+    num_bio_pages: int             = Field(2,    ge=1, le=5, description="Number of parallel bio pages to use")
     state_b64   : str | None = Field(
         None,
         description="Base-64 encoded Playwright storage_state.json "
@@ -75,6 +76,7 @@ async def scrape(body: ScrapeRequest):          # ❶ ← only one parameter now
                 target     = body.target,
                 target_yes = body.target_yes,
                 batch_size = body.batch_size,
+                num_bio_pages = body.num_bio_pages,
             )
     except Exception:
         import traceback, sys

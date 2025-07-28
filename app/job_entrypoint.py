@@ -33,11 +33,13 @@ async def main() -> None:
         target       = os.environ["TARGET"]
         yes          = int(os.getenv("TARGET_YES", 10))
         batch_size   = int(os.getenv("BATCH_SIZE", 30))
+        num_bio_pages = int(os.getenv("NUM_BIO_PAGES", 3))
 
         print(f"STATE_GCS_URI={state_gcs_uri}", flush=True)
         print(f"TARGET={target}", flush=True)
         print(f"TARGET_YES={yes}", flush=True)
         print(f"BATCH_SIZE={batch_size}", flush=True)
+        print(f"NUM_BIO_PAGES={num_bio_pages}", flush=True)
 
         state_path = Path(_download_state_from_gcs(state_gcs_uri))
 
@@ -49,6 +51,7 @@ async def main() -> None:
             target      = target,
             target_yes  = yes,
             batch_size  = batch_size,
+            num_bio_pages = num_bio_pages,
         )
 
         print("scrape_followers finished", flush=True)

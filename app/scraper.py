@@ -173,11 +173,15 @@ async def scrape_followers(
     target: str,
     target_yes: int = 10,
     batch_size: int = 20,
+    num_bio_pages: int = 3,  # New parameter for number of bio pages
 ) -> List[Dict]:
     """
     Reuses a running `browser` (passed from FastAPI lifespan),
     logs in with given creds (if not cached), scrolls follower list,
     returns a list of {'username': str, 'bio': str}.
+    
+    Args:
+        num_bio_pages: Number of parallel bio pages to use for fetching bios
     """
     
     context = await browser.new_context(
@@ -187,16 +191,65 @@ async def scrape_followers(
         record_video_dir="videos/"
     )
     
-    await context.tracing.start(screenshots=True, snapshots=True)
-    video_files = []
-    # Create two tabs: one for followers list, one for bio fetching
+    # Create multiple bio pages for parallel processing
     followers_page = await context.new_page()
-    bio_page = await context.new_page()
+    bio_pages = [await context.new_page() for _ in range(num_bio_pages)]
     
     # Apply stealth measures if available
     if STEALTH_AVAILABLE:
         await stealth_async(followers_page)
-        await stealth_async(bio_page)
+        for bio_page in bio_pages:
+            await stealth_async(bio_page)
+    
+    async def get_bios_parallel(usernames: list[str]) -> list[dict]:
+        """
+        Fetch bios for multiple usernames in parallel using multiple bio pages.
+        Distributes the workload across available bio pages.
+        """
+        if not usernames:
+            return []
+        
+        # Split usernames across bio pages
+        chunk_size = max(1, len(usernames) // num_bio_pages)
+        chunks_list = [usernames[i:i + chunk_size] for i in range(0, len(usernames), chunk_size)]
+        
+        # Ensure we don't have more chunks than bio pages
+        while len(chunks_list) > num_bio_pages:
+            # Merge the last two chunks
+            chunks_list[-2].extend(chunks_list[-1])
+            chunks_list.pop()
+        
+        # Create tasks for each chunk
+        tasks = []
+        for i, chunk in enumerate(chunks_list):
+            if chunk:  # Only create task if chunk is not empty
+                task = asyncio.create_task(
+                    get_bios_for_chunk(bio_pages[i % num_bio_pages], chunk)
+                )
+                tasks.append(task)
+        
+        # Wait for all tasks to complete
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Flatten results and handle any exceptions
+        all_bios = []
+        for result in results:
+            if isinstance(result, Exception):
+                print(f"⚠️ Error in bio fetching: {result}")
+                # Add empty bios for failed chunk to maintain alignment
+                all_bios.extend([{"username": "", "bio": ""}] * len(chunk))
+            else:
+                all_bios.extend(result)
+        
+        return all_bios
+    
+    async def get_bios_for_chunk(bio_page, usernames: list[str]) -> list[dict]:
+        """Fetch bios for a chunk of usernames using a single bio page."""
+        bios = []
+        for username in usernames:
+            bio = await get_bio(bio_page, username)
+            bios.append({"username": username, "bio": bio})
+        return bios
     
     
     try:
@@ -290,26 +343,28 @@ async def scrape_followers(
 
                 # 4️⃣  Batch → classify exactly as you already do
                 if len(batch_handles) >= batch_size:
-                    bios = []
                     try:
-                        for h in batch_handles[:batch_size]:
-                            bio = await get_bio(bio_page, h)
-                            if bio or bio == "":  # Include even empty bios to maintain index alignment
-                                bios.append({"username": h, "bio": bio})
-
+                        # Use parallel bio fetching with multiple pages
+                        current_batch = batch_handles[:batch_size]
+                        bios = await get_bios_parallel(current_batch)
+                        
+                        # Filter out any failed bio fetches (empty usernames)
+                        valid_bios = [b for b in bios if b["username"]]
+                        
                         batch_handles = batch_handles[batch_size:]     # trim
 
-                        flags = await classify_remote(
-                            [b["bio"] for b in bios], client
-                        )
-                        yes_idx = {int(f) for f in flags if f.isdigit()}
-                        for idx in yes_idx:
-                            if bios[idx]["bio"]:            # make sure bio isn’t empty
-                                yes_rows.append({
-                                    "username": bios[idx]["username"],
-                                    "url": f"https://www.instagram.com/{bios[idx]['username']}/",
-                                    "bio": bios[idx]["bio"]
-                                })
+                        if valid_bios:
+                            flags = await classify_remote(
+                                [b["bio"] for b in valid_bios], client
+                            )
+                            yes_idx = {int(f) for f in flags if f.isdigit()}
+                            for idx in yes_idx:
+                                if valid_bios[idx]["bio"]:            # make sure bio isn't empty
+                                    yes_rows.append({
+                                        "username": valid_bios[idx]["username"],
+                                        "url": f"https://www.instagram.com/{valid_bios[idx]['username']}/",
+                                        "bio": valid_bios[idx]["bio"]
+                                    })
 
                         print(f"✅ gathered {len(yes_rows)}/{target_yes} so far…")
                     except RuntimeError as e:
@@ -320,20 +375,21 @@ async def scrape_followers(
             # out of the while loop -> either enough yes's or time ran out
             if batch_handles:  # flush leftovers
                 async with httpx.AsyncClient(timeout=HTTPX_LONG_TIMEOUT) as client:
-                    bios = [
-                        {"username": h, "bio": await get_bio(bio_page, h)}
-                        for h in batch_handles
-                    ]
-                    flags = await classify_remote([b["bio"] for b in bios], client)
-                    yes_idx = {int(f) for f in flags if f.isdigit()}
+                    # Use parallel bio fetching for leftovers too
+                    bios = await get_bios_parallel(batch_handles)
+                    valid_bios = [b for b in bios if b["username"]]
+                    
+                    if valid_bios:
+                        flags = await classify_remote([b["bio"] for b in valid_bios], client)
+                        yes_idx = {int(f) for f in flags if f.isdigit()}
                         # Add "yes" results
-                    for idx in yes_idx:
-                        if bios[idx]["bio"]:            # make sure bio isn’t empty
-                            yes_rows.append({
-                                "username": bios[idx]["username"],
-                                "url": f"https://www.instagram.com/{bios[idx]['username']}/",
-                                "bio": bios[idx]["bio"]
-                            })
+                        for idx in yes_idx:
+                            if valid_bios[idx]["bio"]:            # make sure bio isn't empty
+                                yes_rows.append({
+                                    "username": valid_bios[idx]["username"],
+                                    "url": f"https://www.instagram.com/{valid_bios[idx]['username']}/",
+                                    "bio": valid_bios[idx]["bio"]
+                                })
         # Check if we got partial results due to scrolling or timeout
         elapsed_time = time.perf_counter() - start_time
         if scroll_timeout:
@@ -376,14 +432,14 @@ async def scrape_followers(
         upload_to_gcs(local_path=not_visible_path, destination_blob=not_visible_path)
         # Finalize and upload video files
         await context.close()
-        for p in (followers_page, bio_page):
-            try:
-                await p.close()
-                video_path = await p.video.path()
-                if video_path:
-                    upload_to_gcs(local_path=video_path, destination_blob=f"videos/{os.path.basename(video_path)}")
-            except Exception as ve:
-                print(f"⚠️ Could not upload video: {ve}")
+        # for p in (followers_page, *bio_pages):
+        #     try:
+        #         await p.close()
+        #         video_path = await p.video.path()
+        #         if video_path:
+        #             upload_to_gcs(local_path=video_path, destination_blob=f"videos/{os.path.basename(video_path)}")
+        #     except Exception as ve:
+        #         print(f"⚠️ Could not upload video: {ve}")
         # Send notification about failure
         await send_notification(
             f"Scraping failed for @{target}: {str(e)[:100]}...",
