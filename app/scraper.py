@@ -354,12 +354,19 @@ async def scrape_followers(
                         batch_handles = batch_handles[batch_size:]     # trim
 
                         if valid_bios:
-                            flags = await classify_remote(
-                                [b["bio"] for b in valid_bios], client
-                            )
-                            yes_idx = {int(f) for f in flags if f.isdigit()}
+                            # Process bios in chunks of 10 for classification
+                            all_flags = []
+                            for i in range(0, len(valid_bios), 10):
+                                chunk = valid_bios[i:i+10]
+                                chunk_flags = await classify_remote(
+                                    [b["bio"] for b in chunk], client
+                                )
+                                all_flags.extend(chunk_flags)
+                            
+                            # Process results from all chunks
+                            yes_idx = {int(f) for f in all_flags if f.isdigit()}
                             for idx in yes_idx:
-                                if valid_bios[idx]["bio"]:            # make sure bio isn't empty
+                                if idx < len(valid_bios) and valid_bios[idx]["bio"]:  # make sure bio isn't empty
                                     yes_rows.append({
                                         "username": valid_bios[idx]["username"],
                                         "url": f"https://www.instagram.com/{valid_bios[idx]['username']}/",
@@ -380,11 +387,18 @@ async def scrape_followers(
                     valid_bios = [b for b in bios if b["username"]]
                     
                     if valid_bios:
-                        flags = await classify_remote([b["bio"] for b in valid_bios], client)
-                        yes_idx = {int(f) for f in flags if f.isdigit()}
+                        # Process leftover bios in chunks of 10 for classification
+                        all_flags = []
+                        for i in range(0, len(valid_bios), 10):
+                            chunk = valid_bios[i:i+10]
+                            chunk_flags = await classify_remote([b["bio"] for b in chunk], client)
+                            all_flags.extend(chunk_flags)
+                        
+                        # Process results from all chunks
+                        yes_idx = {int(f) for f in all_flags if f.isdigit()}
                         # Add "yes" results
                         for idx in yes_idx:
-                            if valid_bios[idx]["bio"]:            # make sure bio isn't empty
+                            if idx < len(valid_bios) and valid_bios[idx]["bio"]:  # make sure bio isn't empty
                                 yes_rows.append({
                                     "username": valid_bios[idx]["username"],
                                     "url": f"https://www.instagram.com/{valid_bios[idx]['username']}/",
