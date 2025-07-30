@@ -38,7 +38,7 @@ BIO_PAGE_TIMEOUT_MS = 10_000        # 10 seconds
 BASE_SCROLL_WAIT = 1.0  # Base wait time after each scroll
 IDLE_SCROLL_WAIT = 3.0  # Base wait time when no new followers detected
 PROGRESSIVE_WAIT = True # If True, wait time increases with each idle loop
-MAX_IDLE_LOOPS = 5      # Number of idle loops before giving up (was 3)
+MAX_IDLE_LOOPS = 7      # Number of idle loops before giving up (was 3)
 
 # Timeout for HTTP requests
 HTTPX_LONG_TIMEOUT = httpx.Timeout(connect=30.0, write=30.0, read=10_000.0, pool=None)
@@ -433,25 +433,6 @@ async def scrape_followers(
             return yes_rows
 
     except Exception as e:
-        # Capture the page state on failure
-        os.makedirs("shots", exist_ok=True)
-        not_visible_path = "shots/not_visible.png"
-        try:
-            await followers_page.screenshot(path=not_visible_path, full_page=True)
-        except PlayTimeout:
-            print("Screenshot timed out – continuing without it")
-        upload_to_gcs(local_path=not_visible_path, destination_blob=not_visible_path)
-        # Finalize and upload video files
-        await context.close()
-        # for p in (followers_page, *bio_pages):
-        #     try:
-        #         await p.close()
-        #         video_path = await p.video.path()
-        #         if video_path:
-        #             upload_to_gcs(local_path=video_path, destination_blob=f"videos/{os.path.basename(video_path)}")
-        #     except Exception as ve:
-        #         print(f"⚠️ Could not upload video: {ve}")
-        # Send notification about failure
         await send_notification(
             f"Scraping failed for @{target}: {str(e)[:100]}...",
             f"Instagram Scraper - Error"
@@ -459,4 +440,11 @@ async def scrape_followers(
         raise
     finally:
         # Always close the context so the video is flushed to disk
+        os.makedirs("shots", exist_ok=True)
+        not_visible_path = "shots/not_visible.png"
+        try:
+            await followers_page.screenshot(path=not_visible_path, full_page=True)
+        except PlayTimeout:
+            print("Screenshot timed out – continuing without it")
+        upload_to_gcs(local_path=not_visible_path, destination_blob=not_visible_path)
         await context.close()
