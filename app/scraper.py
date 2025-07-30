@@ -287,6 +287,7 @@ async def scrape_followers(
         yes_rows: list[dict] = []  # final result
         seen_handles: set[str] = set()  # so we don't process duplicates
         batch_handles: list[str] = []  # fills up to `batch_size`
+        total_classified = 0  # Track total number of followers classified
 
         # keep scrolling until we EITHER: (a) have enough yes's OR (b) time is up
         idle_loops = 0
@@ -354,6 +355,9 @@ async def scrape_followers(
                         batch_handles = batch_handles[batch_size:]     # trim
 
                         if valid_bios:
+                            # Increment total classified count
+                            total_classified += len(valid_bios)
+                            
                             # Process bios in chunks of 10 for classification
                             all_flags = []
                             for i in range(0, len(valid_bios), 10):
@@ -387,6 +391,9 @@ async def scrape_followers(
                     valid_bios = [b for b in bios if b["username"]]
                     
                     if valid_bios:
+                        # Increment total classified count for leftovers
+                        total_classified += len(valid_bios)
+                        
                         # Process leftover bios in chunks of 10 for classification
                         all_flags = []
                         for i in range(0, len(valid_bios), 10):
@@ -447,4 +454,11 @@ async def scrape_followers(
         except PlayTimeout:
             print("Screenshot timed out – continuing without it")
         upload_to_gcs(local_path=not_visible_path, destination_blob=not_visible_path)
+        
+        # Print final statistics
+        print(f"📊 Final Statistics:")
+        print(f"   - Total followers classified: {total_classified}")
+        print(f"   - Total followers found: {len(yes_rows)}")
+        print(f"   - Success rate: {(len(yes_rows)/total_classified*100):.1f}%" if total_classified > 0 else "   - Success rate: N/A")
+        
         await context.close()
