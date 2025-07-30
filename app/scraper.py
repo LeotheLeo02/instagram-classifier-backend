@@ -434,15 +434,12 @@ async def scrape_followers(
 
     except Exception as e:
         # Capture the page state on failure
-        await followers_page.screenshot(
-            path=f"shots/error_{target}.png", full_page=True
-        )
-        print(
-            f"❌ Error during scrape: {e}. Screenshot saved to shots/error_{target}.png"
-        )
         os.makedirs("shots", exist_ok=True)
         not_visible_path = "shots/not_visible.png"
-        await followers_page.screenshot(path=not_visible_path, full_page=True)
+        try:
+            await followers_page.screenshot(path=not_visible_path, full_page=True)
+        except PlayTimeout:
+            print("Screenshot timed out – continuing without it")
         upload_to_gcs(local_path=not_visible_path, destination_blob=not_visible_path)
         # Finalize and upload video files
         await context.close()
