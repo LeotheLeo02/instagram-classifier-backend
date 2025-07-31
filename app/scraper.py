@@ -16,6 +16,21 @@ import httpx
 import os
 import time
 
+
+def format_duration(seconds: float) -> str:
+    """Format duration in seconds to a human-readable string."""
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    elif seconds < 3600:
+        minutes = int(seconds // 60)
+        remaining_seconds = seconds % 60
+        return f"{minutes}m {remaining_seconds:.1f}s"
+    else:
+        hours = int(seconds // 3600)
+        remaining_minutes = int((seconds % 3600) // 60)
+        remaining_seconds = seconds % 60
+        return f"{hours}h {remaining_minutes}m {remaining_seconds:.1f}s"
+
 # Try to import playwright-stealth for enhanced anti-detection
 try:
     from playwright_stealth import stealth_async
@@ -414,27 +429,30 @@ async def scrape_followers(
         # Check if we got partial results due to scrolling or timeout
         elapsed_time = time.perf_counter() - start_time
         if scroll_timeout:
+            formatted_time = format_duration(elapsed_time)
             print(
-                f"⚠️ Returning partial results: {len(yes_rows)}/{target_yes} (scroll timeout)"
+                f"⚠️ Returning partial results: {len(yes_rows)}/{target_yes} (scroll timeout after {formatted_time})"
             )
             await send_notification(
-                f"Partial results: {len(yes_rows)}/{target_yes} followers found for @{target} (scroll timeout)",
+                f"Partial results: {len(yes_rows)}/{target_yes} followers found for @{target} in {formatted_time} (scroll timeout)",
                 "Instagram Scraper - Partial Results",
             )
             return yes_rows
         elif len(yes_rows) < target_yes and elapsed_time >= (timeout_seconds - 30):
-            print(f"⚠️ Returning partial results: {len(yes_rows)}/{target_yes} (timeout reached after {elapsed_time:.1f}s)")
+            formatted_time = format_duration(elapsed_time)
+            print(f"⚠️ Returning partial results: {len(yes_rows)}/{target_yes} (timeout reached after {formatted_time})")
             # Send notification about partial results
             await send_notification(
-                f"Partial results: {len(yes_rows)}/{target_yes} followers found for @{target}",
+                f"Partial results: {len(yes_rows)}/{target_yes} followers found for @{target} in {formatted_time}",
                 f"Instagram Scraper - Partial Results"
             )
             return yes_rows
         else:
-            print(f"✅ Completed successfully: {len(yes_rows)}/{target_yes} results in {elapsed_time:.1f}s")
+            formatted_time = format_duration(elapsed_time)
+            print(f"✅ Completed successfully: {len(yes_rows)}/{target_yes} results in {formatted_time}")
             # Send notification about successful completion
             await send_notification(
-                f"Successfully found {len(yes_rows)}/{target_yes} followers for @{target} in {elapsed_time:.1f}s",
+                f"Successfully found {len(yes_rows)}/{target_yes} followers for @{target} in {formatted_time}",
                 f"Instagram Scraper - Complete"
             )
             return yes_rows
@@ -456,9 +474,12 @@ async def scrape_followers(
         upload_to_gcs(local_path=not_visible_path, destination_blob=not_visible_path)
         
         # Print final statistics
+        elapsed_time = time.perf_counter() - start_time
+        formatted_time = format_duration(elapsed_time)
         print(f"📊 Final Statistics:")
         print(f"   - Total followers classified: {total_classified}")
         print(f"   - Total followers found: {len(yes_rows)}")
         print(f"   - Success rate: {(len(yes_rows)/total_classified*100):.1f}%" if total_classified > 0 else "   - Success rate: N/A")
+        print(f"   - Total runtime: {formatted_time}")
         
         await context.close()
