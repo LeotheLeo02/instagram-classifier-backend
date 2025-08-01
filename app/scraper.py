@@ -413,7 +413,7 @@ class InstagramScraper:
                         yes_rows.extend(yes_results)
         
         # Save results
-        await self._save_results(all_scraped_bios, yes_rows, target, start_time, timeout_seconds)
+        await self._save_results(all_scraped_bios, yes_rows, target, target_yes, start_time, timeout_seconds)
         
         return yes_rows
     
@@ -422,6 +422,7 @@ class InstagramScraper:
         all_scraped_bios: List[Dict], 
         yes_rows: List[Dict], 
         target: str, 
+        target_yes: int,
         start_time: float, 
         timeout_seconds: int
     ) -> None:
