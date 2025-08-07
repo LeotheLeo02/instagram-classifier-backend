@@ -354,6 +354,11 @@ class InstagramScraper:
                         idle_loops += 1
                         if idle_loops >= ScraperConfig.MAX_IDLE_LOOPS:
                             print(f"[stop] producer: no new followers after {ScraperConfig.MAX_IDLE_LOOPS} scrolls; setting stop_event and exiting")
+                            # Flush any remaining current_batch before exiting
+                            if current_batch:
+                                await username_queue.put(current_batch)
+                                stats["total_scraped"] += len(current_batch)
+                                current_batch = []
                             stop_event.set()
                             break
                     else:
@@ -365,6 +370,11 @@ class InstagramScraper:
                         await user_links.nth(-1).scroll_into_view_if_needed()
                     except PlayTimeout:
                         print("[stop] producer: scroll timeout - likely end of list; setting stop_event and exiting")
+                        # Flush any remaining current_batch before exiting
+                        if current_batch:
+                            await username_queue.put(current_batch)
+                            stats["total_scraped"] += len(current_batch)
+                            current_batch = []
                         stop_event.set()
                         break
 
@@ -387,7 +397,7 @@ class InstagramScraper:
         async def bio_fetcher():
             """Continuously fetch bios for usernames from the queue."""
             try:
-                while not stop_event.is_set():
+                while True:
                     try:
                         usernames = await asyncio.wait_for(username_queue.get(), timeout=2.0)
                     except asyncio.TimeoutError:
@@ -401,7 +411,18 @@ class InstagramScraper:
                         # Fetch bios in parallel using multiple pages
                         bios = await self._get_bios_parallel(bio_pages, usernames)
 
-                        # Put each bio in the classification queue
+                        # Record all scraped bios (including empty bios) for parity with linear path
+                        if bios:
+                            async with results_lock:
+                                for b in bios:
+                                    if b and b.get("username"):
+                                        all_bios.append({
+                                            "username": b["username"],
+                                            "url": f"https://www.instagram.com/{b['username']}/",
+                                            "bio": b.get("bio", "")
+                                        })
+
+                        # Put only non-empty bios into the classification queue
                         for bio in bios:
                             if bio and bio.get("bio"):
                                 # Backpressure: await if the queue is full
@@ -426,7 +447,7 @@ class InstagramScraper:
             batch_buffer = []
 
             try:
-                while not stop_event.is_set():
+                while True:
                     # Collect bios for batch classification
                     try:
                         bio = await asyncio.wait_for(bio_queue.get(), timeout=ScraperConfig.BATCH_FLUSH_TIMEOUT_SEC)
@@ -470,16 +491,12 @@ class InstagramScraper:
                     for i, (bio, flag) in enumerate(zip(bios, flags)):
                         stats["total_classified"] += 1
 
-                        # Store all processed bios
-                        bio_entry = {
-                            "username": bio["username"],
-                            "url": f"https://www.instagram.com/{bio['username']}/",
-                            "bio": bio["bio"]
-                        }
-                        all_bios.append(bio_entry)
-
                         if flag and flag.isdigit() and int(flag) == i:
-                            yes_results.append(bio_entry)  # Use same dict to save memory
+                            yes_results.append({
+                                "username": bio["username"],
+                                "url": f"https://www.instagram.com/{bio['username']}/",
+                                "bio": bio["bio"]
+                            })
                             stats["total_yes"] += 1
                             print(f"✅ Found match #{stats['total_yes']}: {bio['username']}")
 
@@ -519,21 +536,14 @@ class InstagramScraper:
             # Ensure shutdown is prompt and graceful
             stop_event.set()
 
-            # Give tasks a moment to exit cooperatively
-            try:
-                done2, pending2 = await asyncio.wait(tasks, timeout=5)
-                for t in pending2:
-                    t.cancel()
-                    print(f"[cancel] cancelled task {t.get_name()}")
-                # Ensure all tasks are gathered
-                await asyncio.gather(*tasks, return_exceptions=True)
-                print("[shutdown] all tasks have been gathered")
-            except Exception:
-                # As a last resort, cancel anything lingering
-                for t in tasks:
-                    if not t.done():
-                        t.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
+            # Let the fetcher and classifier finish draining queues; then cancel if needed
+            done2, pending2 = await asyncio.wait(tasks, timeout=30)
+            for t in pending2:
+                t.cancel()
+                print(f"[cancel] cancelled task {t.get_name()}")
+            # Ensure all tasks are gathered
+            await asyncio.gather(*tasks, return_exceptions=True)
+            print("[shutdown] all tasks have been gathered")
 
             # Also cancel the wait_task if it still exists
             try:
@@ -603,7 +613,7 @@ class InstagramScraper:
                 await stealth_async(bio_page)
         
         try:
-            return await self._scrape_followers_impl(
+            return await self._scrape_followers_parallel(
                 context, followers_page, bio_pages, target, target_yes, batch_size
             )
         finally:
