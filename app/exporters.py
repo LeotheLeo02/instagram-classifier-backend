@@ -22,7 +22,7 @@ class CSVExporter:
         bucket = client.bucket(self.gcs_bucket)
         blob = bucket.blob(destination_blob)
         blob.upload_from_filename(local_path)
-        print(f"✅ Screenshot uploaded to gs://{self.gcs_bucket}/{destination_blob}")
+        print(f"Uploaded to gs://{self.gcs_bucket}/{destination_blob}")
     
     def save_bios_to_csv_and_upload(
         self, 
