@@ -10,6 +10,7 @@ This module provides functionality to:
 """
 
 import asyncio
+import math
 import os
 import time
 import json
@@ -153,14 +154,9 @@ class InstagramScraper:
         
         num_bio_pages = len(bio_pages)
         
-        # Split usernames across bio pages
-        chunk_size = max(1, len(usernames) // num_bio_pages)
+        # Split usernames across bio pages (more even distribution)
+        chunk_size = max(1, math.ceil(len(usernames) / num_bio_pages))
         chunks_list = [usernames[i:i + chunk_size] for i in range(0, len(usernames), chunk_size)]
-        
-        # Ensure we don't have more chunks than bio pages
-        while len(chunks_list) > num_bio_pages:
-            chunks_list[-2].extend(chunks_list[-1])
-            chunks_list.pop()
         
         # Create tasks for each chunk with proper error handling
         tasks = []
@@ -179,7 +175,8 @@ class InstagramScraper:
         for result, chunk in zip(results, chunks_list):
             if isinstance(result, Exception):
                 print(f"⚠️ Error in bio fetching: {result}")
-                all_bios.extend([{"username": "", "bio": ""}] * len(chunk))
+                # Skip this chunk; do not enqueue empty placeholders
+                continue
             else:
                 all_bios.extend(result)
         
@@ -284,9 +281,9 @@ class InstagramScraper:
         """
         from asyncio import Queue
         
-        # Initialize queues and shared state - use unbounded queues to prevent deadlocks
-        username_queue = Queue()  # Unbounded to prevent producer blocking
-        bio_queue = Queue()  # Unbounded to prevent fetcher blocking
+        # Initialize bounded queues to provide backpressure and prevent memory growth
+        username_queue = Queue(maxsize=ScraperConfig.USERNAME_QUEUE_MAXSIZE)
+        bio_queue = Queue(maxsize=ScraperConfig.BIO_QUEUE_MAXSIZE)
         
         # Thread-safe results storage
         yes_results = []
@@ -346,12 +343,8 @@ class InstagramScraper:
 
                             # Put usernames in queue as we find them
                             if len(current_batch) >= batch_size:
-                                try:
-                                    await asyncio.wait_for(username_queue.put(current_batch[:batch_size]), timeout=1.0)
-                                except asyncio.TimeoutError:
-                                    if stop_event.is_set():
-                                        return
-                                    continue
+                                # Backpressure: await if the queue is full
+                                await username_queue.put(current_batch[:batch_size])
                                 current_batch = current_batch[batch_size:]
                                 stats["total_scraped"] += batch_size
 
@@ -381,23 +374,15 @@ class InstagramScraper:
 
                     # Put remaining batch if any
                     if current_batch:
-                        try:
-                            await asyncio.wait_for(username_queue.put(current_batch), timeout=1.0)
-                        except asyncio.TimeoutError:
-                            if stop_event.is_set():
-                                return
+                        await username_queue.put(current_batch)
                         stats["total_scraped"] += len(current_batch)
 
             except Exception as e:
                 print(f"Username producer error: {e}")
             finally:
                 # Signal end of production
-                try:
-                    await asyncio.wait_for(username_queue.put(None), timeout=1.0)
-                    print("[producer] sent sentinel None to username_queue")
-                except asyncio.TimeoutError:
-                    print("[producer] failed to send sentinel; queue busy")
-                    pass  # Queue might be full, but we're shutting down anyway
+                await username_queue.put(None)
+                print("[producer] sent sentinel None to username_queue")
         
         async def bio_fetcher():
             """Continuously fetch bios for usernames from the queue."""
@@ -419,12 +404,8 @@ class InstagramScraper:
                         # Put each bio in the classification queue
                         for bio in bios:
                             if bio and bio.get("bio"):
-                                try:
-                                    await asyncio.wait_for(bio_queue.put(bio), timeout=1.0)
-                                except asyncio.TimeoutError:
-                                    if stop_event.is_set():
-                                        return
-                                    continue
+                                # Backpressure: await if the queue is full
+                                await bio_queue.put(bio)
                                 stats["total_fetched"] += 1
 
                     except Exception as e:
@@ -436,12 +417,8 @@ class InstagramScraper:
                 print(f"Bio fetcher error: {e}")
             finally:
                 # Signal end of fetching
-                try:
-                    await asyncio.wait_for(bio_queue.put(None), timeout=1.0)
-                    print("[fetcher] sent sentinel None to classifier")
-                except asyncio.TimeoutError:
-                    print("[fetcher] failed to send sentinel to classifier; queue busy")
-                    pass
+                await bio_queue.put(None)
+                print("[fetcher] sent sentinel None to classifier")
         
         async def bio_classifier():
             """Continuously classify bios from the queue."""
@@ -452,7 +429,7 @@ class InstagramScraper:
                 while not stop_event.is_set():
                     # Collect bios for batch classification
                     try:
-                        bio = await asyncio.wait_for(bio_queue.get(), timeout=2.0)
+                        bio = await asyncio.wait_for(bio_queue.get(), timeout=ScraperConfig.BATCH_FLUSH_TIMEOUT_SEC)
                     except asyncio.TimeoutError:
                         # Process partial batch if we have any
                         if batch_buffer:
@@ -530,7 +507,7 @@ class InstagramScraper:
             done, pending = await asyncio.wait(
                 {wait_task, *tasks},
                 return_when=asyncio.FIRST_COMPLETED,
-                timeout=3600  # 1 hour timeout
+                timeout=ScraperConfig.SCRAPE_MAX_SECONDS,
             )
 
             print(f"🔄 Done: {[t.get_name() for t in done]} | Pending: {[t.get_name() for t in pending]}")
@@ -542,15 +519,21 @@ class InstagramScraper:
             # Ensure shutdown is prompt and graceful
             stop_event.set()
 
-            # Cancel any remaining tasks
-            for t in tasks:
-                if not t.done():
+            # Give tasks a moment to exit cooperatively
+            try:
+                done2, pending2 = await asyncio.wait(tasks, timeout=5)
+                for t in pending2:
                     t.cancel()
                     print(f"[cancel] cancelled task {t.get_name()}")
-
-            # Wait for tasks to complete gracefully
-            await asyncio.gather(*tasks, return_exceptions=True)
-            print("[shutdown] all tasks have been gathered")
+                # Ensure all tasks are gathered
+                await asyncio.gather(*tasks, return_exceptions=True)
+                print("[shutdown] all tasks have been gathered")
+            except Exception:
+                # As a last resort, cancel anything lingering
+                for t in tasks:
+                    if not t.done():
+                        t.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
 
             # Also cancel the wait_task if it still exists
             try:
@@ -574,7 +557,7 @@ class InstagramScraper:
             print(f"  • Time elapsed: {formatted_time}")
 
             # Save results with all processed bios
-            timeout_seconds = 3600
+            timeout_seconds = ScraperConfig.SCRAPE_MAX_SECONDS
             await self._save_results(all_bios, yes_results, target, target_yes, start_time, timeout_seconds)
 
         return yes_results

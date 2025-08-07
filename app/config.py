@@ -26,6 +26,16 @@ class ScraperConfig:
     # Classification settings
     CLASSIFICATION_CHUNK_SIZE = 10
     CLASSIFICATION_MAX_RETRIES = 2
+    # When the classifier has a partial batch buffered, flush it after this many seconds
+    BATCH_FLUSH_TIMEOUT_SEC = 1.0
+
+    # Parallelism/backpressure
+    # Use bounded queues to prevent unbounded memory growth under backpressure
+    USERNAME_QUEUE_MAXSIZE = 20
+    BIO_QUEUE_MAXSIZE = 200
+
+    # Overall safety timeout for a single scrape run (seconds)
+    SCRAPE_MAX_SECONDS = 3600
     
     # Christian symbols for bio validation
     CHRISTIAN_SYMBOLS = {
