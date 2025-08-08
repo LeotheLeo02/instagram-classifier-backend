@@ -39,11 +39,14 @@ from .notifications import NotificationService
 class InstagramScraper:
     """Main Instagram scraper class."""
     
-    def __init__(self, gcs_bucket: Optional[str] = None):
+    def __init__(self, gcs_bucket: Optional[str] = None, exec_id: Optional[str] = None):
         self.gcs_bucket = gcs_bucket or os.getenv("SCREENSHOT_BUCKET")
         self.csv_exporter = CSVExporter(self.gcs_bucket)
         self.bio_classifier = BioClassifier()
         self.notification_service = NotificationService()
+        # Preferred exec_id comes from caller/env so backend/launcher can pre-select folder
+        # Fallback to None; we'll generate if still missing when needed
+        self.exec_id = exec_id or os.getenv("EXEC_ID") or os.getenv("SCRAPE_EXEC_ID")
 
     def _gcs_prefix(self, target: str, operation_id: str) -> str:
         """Stable prefix for result artifacts in GCS."""
@@ -69,6 +72,33 @@ class InstagramScraper:
                 os.remove(tmp_path)
             except OSError:
                 pass
+
+    def _ensure_start_artifacts(self, target: str, target_yes: int, started_at_epoch: Optional[int] = None) -> str:
+        """Ensure a stable exec_id and upload START/meta(status=running) before heavy work.
+        Returns the effective exec_id used.
+        """
+        if not self.exec_id:
+            # Generate only if not provided by env or caller
+            self.exec_id = f"op_{int(time.time())}"
+        if started_at_epoch is None:
+            started_at_epoch = int(time.time())
+
+        prefix = self._gcs_prefix(target, self.exec_id)
+        # Upload a START marker and running meta to avoid 404s for early polling
+        try:
+            self._upload_json_to_gcs({"ok": True, "ts": started_at_epoch}, prefix + "START")
+            running_meta = {
+                "status": "running",
+                "target": target,
+                "target_yes": target_yes,
+                "started_at": started_at_epoch,
+                "operation_id": self.exec_id,
+            }
+            self._upload_json_to_gcs(running_meta, prefix + "meta.json")
+        except Exception:
+            # Non-fatal; scraping can still proceed even if pre-create fails
+            pass
+        return self.exec_id
     
     @staticmethod
     def format_duration(seconds: float) -> str:
@@ -613,6 +643,10 @@ class InstagramScraper:
                 await stealth_async(bio_page)
         
         try:
+            # Pre-create artifacts only if an exec_id was NOT provided by the orchestrator
+            # When EXEC_ID is passed via env/argument, the backend already created START/meta
+            if not self.exec_id:
+                self._ensure_start_artifacts(target=target, target_yes=target_yes, started_at_epoch=int(time.time()))
             return await self._scrape_followers_parallel(
                 context, followers_page, bio_pages, target, target_yes, batch_size
             )
@@ -781,33 +815,16 @@ class InstagramScraper:
         timeout_seconds: int
     ) -> None:
         """Save scraping results to CSV/JSON, upload artifacts, and send notifications."""
-        # Always generate a stable operation id/prefix for artifacts
-        operation_id = f"op_{int(time.time())}"
+        # Use provided exec_id if available; otherwise generate one
+        if not self.exec_id:
+            self.exec_id = f"op_{int(time.time())}"
+        operation_id = self.exec_id
         prefix = self._gcs_prefix(target, operation_id)
 
-        csv_gcs_path = None
-        classification_csv_path = None
-
-        # Save CSVs if we scraped anything
+        # CSV saving disabled by request; keep meta keys as None
         if all_scraped_bios:
-            csv_gcs_path = self.csv_exporter.save_bios_to_csv_and_upload(
-                all_scraped_bios, target, operation_id
-            )
             print(f"📊 Total bios scraped: {len(all_scraped_bios)}")
             print(f"📊 Total bios classified as YES: {len(yes_rows)}")
-            print(f"📊 CSV saved to: {csv_gcs_path}")
-            
-            # Save classification results CSV (parallel array yes/no)
-            all_classifications = []
-            for bio_dict in all_scraped_bios:
-                is_yes = any(yes_row["username"] == bio_dict["username"] for yes_row in yes_rows)
-                classification = "yes" if is_yes else "no"
-                all_classifications.append(classification)
-                
-            classification_csv_path = self.csv_exporter.save_classification_results_to_csv_and_upload(
-                all_scraped_bios, all_classifications, target, operation_id
-            )
-            print(f"📊 Classification results saved to: {classification_csv_path}")
         
         # Build JSON artifacts (results + meta), then upload a DONE marker last as the completion signal
         finished_at_epoch = int(time.time())
@@ -826,8 +843,6 @@ class InstagramScraper:
             "target": target,
             "target_yes": target_yes,
             "yes_count": len(yes_rows),
-            "csv_path": csv_gcs_path,
-            "classification_csv_path": classification_csv_path,
             "finished_at": finished_at_epoch,
             "duration_seconds": duration_seconds,
             "operation_id": operation_id,
