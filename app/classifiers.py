@@ -20,7 +20,8 @@ class BioClassifier:
         self, 
         bio_texts: List[str], 
         client: httpx.AsyncClient, 
-        max_retries: int = ScraperConfig.CLASSIFICATION_MAX_RETRIES
+        max_retries: int = ScraperConfig.CLASSIFICATION_MAX_RETRIES,
+        criteria_text: str | None = None,
     ) -> List[str]:
         """
         Classify bios using the remote API with retry logic.
@@ -51,6 +52,10 @@ class BioClassifier:
                 
                 # Make API request
                 request_payload = {"bios": valid_bios}
+                if criteria_text is not None and isinstance(criteria_text, str) and criteria_text.strip():
+                    print(f"🧪 [DEBUG] Passing per-request criteria to classifier API (chars={len(criteria_text)})")
+                    request_payload["criteria"] = criteria_text
+                print(f"🌐 [DEBUG] POST classify bios: count={len(valid_bios)}")
                 resp = await client.post(
                     self.api_url,
                     json=request_payload,

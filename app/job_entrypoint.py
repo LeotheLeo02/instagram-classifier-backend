@@ -30,16 +30,24 @@ async def main() -> None:
         browser = await pw.chromium.launch(headless=True, args=["--no-sandbox"])
 
         state_gcs_uri = os.environ["STATE_GCS_URI"]
-        target       = os.environ["TARGET"]
-        yes          = int(os.getenv("TARGET_YES", 10))
-        batch_size   = int(os.getenv("BATCH_SIZE", 30))
+        target        = os.environ["TARGET"]
+        yes           = int(os.getenv("TARGET_YES", 10))
+        batch_size    = int(os.getenv("BATCH_SIZE", 30))
         num_bio_pages = int(os.getenv("NUM_BIO_PAGES", 3))
+        # Optional per-job criteria
+        preset_id     = os.getenv("CRITERIA_PRESET_ID")
+        crit_b64      = os.getenv("CRITERIA_TEXT_B64")
+        criteria_text = base64.b64decode(crit_b64).decode("utf-8") if crit_b64 else None
 
         print(f"STATE_GCS_URI={state_gcs_uri}", flush=True)
         print(f"TARGET={target}", flush=True)
         print(f"TARGET_YES={yes}", flush=True)
         print(f"BATCH_SIZE={batch_size}", flush=True)
         print(f"NUM_BIO_PAGES={num_bio_pages}", flush=True)
+        if preset_id:
+            print(f"CRITERIA_PRESET_ID={preset_id}", flush=True)
+        if criteria_text is not None:
+            print(f"CRITERIA_TEXT_B64(len)={len(crit_b64) if crit_b64 else 0}", flush=True)
 
         state_path = Path(_download_state_from_gcs(state_gcs_uri))
 
@@ -52,6 +60,7 @@ async def main() -> None:
             target_yes  = yes,
             batch_size  = batch_size,
             num_bio_pages = num_bio_pages,
+            criteria_text = criteria_text,
         )
 
         print("scrape_followers finished", flush=True)

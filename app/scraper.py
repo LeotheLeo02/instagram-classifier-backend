@@ -215,7 +215,8 @@ class InstagramScraper:
     async def _process_bio_batch(
         self, 
         bios: List[Dict], 
-        client: httpx.AsyncClient
+        client: httpx.AsyncClient,
+        criteria_text: str | None = None,
     ) -> List[Dict]:
         """Process a batch of bios through validation and classification."""
         # Validate and clean bios
@@ -241,10 +242,10 @@ class InstagramScraper:
         for i in range(0, len(valid_bios), ScraperConfig.CLASSIFICATION_CHUNK_SIZE):
             chunk = valid_bios[i:i + ScraperConfig.CLASSIFICATION_CHUNK_SIZE]
             chunk_num = i // ScraperConfig.CLASSIFICATION_CHUNK_SIZE + 1
-            
             try:
+                print(f"🔎 [DEBUG] Classifying chunk {chunk_num} (size={len(chunk)}) with custom criteria={bool(criteria_text and criteria_text.strip())}")
                 chunk_flags = await self.bio_classifier.classify_bios(
-                    [b["bio"] for b in chunk], client
+                    [b["bio"] for b in chunk], client, criteria_text=criteria_text
                 )
                 all_flags.extend(chunk_flags)
                 chunk_success_count += 1
@@ -304,6 +305,7 @@ class InstagramScraper:
         target: str,
         target_yes: int,
         batch_size: int,
+        criteria_text: Optional[str] = None,
     ) -> List[Dict]:
         """
         Parallel scraping implementation using producer-consumer pattern.
@@ -484,21 +486,21 @@ class InstagramScraper:
                     except asyncio.TimeoutError:
                         # Process partial batch if we have any
                         if batch_buffer:
-                            await process_classification_batch(batch_buffer, client)
+                            await process_classification_batch(batch_buffer, client, criteria_text)
                             batch_buffer = []
                         continue
 
                     if bio is None:  # End signal
                         print("[classifier] got sentinel; processing remaining batch and exiting")
                         if batch_buffer:
-                            await process_classification_batch(batch_buffer, client)
+                            await process_classification_batch(batch_buffer, client, criteria_text)
                         break
 
                     batch_buffer.append(bio)
 
                     # Process when we have a full batch
                     if len(batch_buffer) >= ScraperConfig.CLASSIFICATION_CHUNK_SIZE:
-                        await process_classification_batch(batch_buffer, client)
+                        await process_classification_batch(batch_buffer, client, criteria_text)
                         batch_buffer = []
 
             except Exception as e:
@@ -506,14 +508,15 @@ class InstagramScraper:
             finally:
                 await client.aclose()
         
-        async def process_classification_batch(bios: List[Dict], client):
+        async def process_classification_batch(bios: List[Dict], client, criteria_text_param: Optional[str]):
             """Process a batch of bios for classification."""
             try:
                 # Extract just the bio text for classification
                 bio_texts = [b["bio"] for b in bios]
 
                 # Classify the batch
-                flags = await self.bio_classifier.classify_bios(bio_texts, client)
+                print(f"🧪 [DEBUG] process_classification_batch: size={len(bio_texts)} custom_criteria={bool(criteria_text_param and criteria_text_param.strip())}")
+                flags = await self.bio_classifier.classify_bios(bio_texts, client, criteria_text=criteria_text_param)
                 print(f"[classifier] processed batch of {len(bio_texts)} bios; got {len(flags)} flags")
 
                 # Process results
@@ -610,6 +613,7 @@ class InstagramScraper:
         target_yes: int = 10,
         batch_size: int = 20,
         num_bio_pages: int = 3,
+        criteria_text: Optional[str] = None,
     ) -> List[Dict]:
         """
         Scrape followers from a target Instagram account.
@@ -648,7 +652,7 @@ class InstagramScraper:
             if not self.exec_id:
                 self._ensure_start_artifacts(target=target, target_yes=target_yes, started_at_epoch=int(time.time()))
             return await self._scrape_followers_parallel(
-                context, followers_page, bio_pages, target, target_yes, batch_size
+                context, followers_page, bio_pages, target, target_yes, batch_size, criteria_text
             )
         finally:
             await self._cleanup(context, followers_page)
@@ -896,6 +900,7 @@ async def scrape_followers(
     target_yes: int = 10,
     batch_size: int = 20,
     num_bio_pages: int = 3,
+    criteria_text: Optional[str] = None,
 ) -> List[Dict]:
     """
     Backward compatibility function for the old API.
@@ -904,5 +909,5 @@ async def scrape_followers(
     """
     scraper = InstagramScraper()
     return await scraper.scrape_followers(
-        browser, state_path, target, target_yes, batch_size, num_bio_pages
+        browser, state_path, target, target_yes, batch_size, num_bio_pages, criteria_text
     )
