@@ -14,6 +14,7 @@ import math
 import os
 import time
 import json
+import re
 import tempfile
 from pathlib import Path
 from typing import List, Dict, Optional, Set
@@ -129,6 +130,37 @@ class InstagramScraper:
         if yes_count > 0:
             progress = (yes_count / target_yes) * 100
             print(f"   - Batch contribution to target: {progress:.1f}%")
+
+    def _parse_username_from_href(self, href: Optional[str]) -> Optional[str]:
+        """Parse a username from an anchor href.
+        Supports relative like "/user/" and absolute like "https://www.instagram.com/user/".
+        Filters out non-profile paths such as /p/, /explore/, etc.
+        """
+        if not href:
+            return None
+        try:
+            if href.startswith("http"):
+                from urllib.parse import urlparse
+                path = urlparse(href).path
+            else:
+                path = href
+
+            if not path or path == "/":
+                return None
+
+            disallowed_prefixes = (
+                "/p/", "/explore/", "/reels/", "/stories/", "/direct/", "/accounts/",
+            )
+            if any(path.startswith(pref) for pref in disallowed_prefixes):
+                return None
+
+            candidate = path.strip("/").split("/")[0]
+            # Instagram usernames: letters, digits, dot, underscore (1..30)
+            if re.match(r"^[A-Za-z0-9._]{1,30}$", candidate):
+                return candidate
+        except Exception:
+            return None
+        return None
     
     async def _get_bio(self, page: Page, username: str) -> str:
         """Extract bio from a user's profile page."""
@@ -173,7 +205,10 @@ class InstagramScraper:
         """Fetch bios for a chunk of usernames using a single bio page."""
         bios = []
         for username in usernames:
-            bio = await self._get_bio(bio_page, username)
+            try:
+                bio = await self._get_bio(bio_page, username)
+            except RuntimeError:
+                bio = ""
             bios.append({"username": username, "bio": bio})
         return bios
     
@@ -328,7 +363,8 @@ class InstagramScraper:
         # Statistics
         stats = {
             "total_scraped": 0,
-            "total_fetched": 0,
+            "total_fetched": 0,   # attempted bios (including empty)
+            "total_nonempty": 0,  # non-empty bios
             "total_classified": 0,
             "total_yes": 0
         }
@@ -365,13 +401,15 @@ class InstagramScraper:
                 previous_count = 0
 
                 while not stop_event.is_set():
-                    # Collect visible handles
+                    # Collect visible handles from href attributes (more reliable than link text)
                     current_batch = []
-                    for h in await user_links.all_inner_texts():
-                        h = h.strip()
-                        if h and h not in seen_handles:
-                            seen_handles.add(h)
-                            current_batch.append(h)
+                    elements = await user_links.element_handles()
+                    for el in elements:
+                        href = await el.get_attribute("href")
+                        username = self._parse_username_from_href(href)
+                        if username and username not in seen_handles:
+                            seen_handles.add(username)
+                            current_batch.append(username)
 
                             # Put usernames in queue as we find them
                             if len(current_batch) >= batch_size:
@@ -422,8 +460,14 @@ class InstagramScraper:
             except Exception as e:
                 print(f"Username producer error: {e}")
             finally:
-                # Signal end of production
-                await username_queue.put(None)
+                # Signal end of production (avoid blocking if queue is full)
+                try:
+                    username_queue.put_nowait(None)
+                except Exception:
+                    try:
+                        await asyncio.wait_for(username_queue.put(None), timeout=1.0)
+                    except Exception:
+                        print("[producer] failed to send sentinel; username_queue may be full")
                 print("[producer] sent sentinel None to username_queue")
         
         async def bio_fetcher():
@@ -443,6 +487,9 @@ class InstagramScraper:
                         # Fetch bios in parallel using multiple pages
                         bios = await self._get_bios_parallel(bio_pages, usernames)
 
+                        # Track attempted bios (including empty)
+                        stats["total_fetched"] += len(bios)
+
                         # Record all scraped bios (including empty bios) for parity with linear path
                         if bios:
                             async with results_lock:
@@ -459,7 +506,7 @@ class InstagramScraper:
                             if bio and bio.get("bio"):
                                 # Backpressure: await if the queue is full
                                 await bio_queue.put(bio)
-                                stats["total_fetched"] += 1
+                                stats["total_nonempty"] += 1
 
                     except Exception as e:
                         print(f"Bio fetch error: {e}")
@@ -469,8 +516,14 @@ class InstagramScraper:
             except Exception as e:
                 print(f"Bio fetcher error: {e}")
             finally:
-                # Signal end of fetching
-                await bio_queue.put(None)
+                # Signal end of fetching (avoid blocking if queue is full)
+                try:
+                    bio_queue.put_nowait(None)
+                except Exception:
+                    try:
+                        await asyncio.wait_for(bio_queue.put(None), timeout=1.0)
+                    except Exception:
+                        print("[fetcher] failed to send sentinel; bio_queue may be full")
                 print("[fetcher] sent sentinel None to classifier")
         
         async def bio_classifier():
@@ -480,6 +533,10 @@ class InstagramScraper:
 
             try:
                 while True:
+                    # Exit promptly if target met and nothing left to process
+                    if stop_event.is_set() and bio_queue.qsize() == 0 and not batch_buffer:
+                        print("[classifier] stop_event set and queue empty; exiting")
+                        break
                     # Collect bios for batch classification
                     try:
                         bio = await asyncio.wait_for(bio_queue.get(), timeout=ScraperConfig.BATCH_FLUSH_TIMEOUT_SEC)
@@ -569,6 +626,16 @@ class InstagramScraper:
             # Ensure shutdown is prompt and graceful
             stop_event.set()
 
+            # Proactively send sentinels to unblock queues in case producers/consumers are waiting
+            try:
+                username_queue.put_nowait(None)
+            except Exception:
+                pass
+            try:
+                bio_queue.put_nowait(None)
+            except Exception:
+                pass
+
             # Let the fetcher and classifier finish draining queues; then cancel if needed
             done2, pending2 = await asyncio.wait(tasks, timeout=30)
             for t in pending2:
@@ -593,7 +660,8 @@ class InstagramScraper:
             # Print final statistics
             print(f"\n📊 Final Statistics:")
             print(f"  • Total usernames scraped: {stats['total_scraped']}")
-            print(f"  • Total bios fetched: {stats['total_fetched']}")
+            print(f"  • Total bios fetched (attempted): {stats['total_fetched']}")
+            print(f"  • Total non-empty bios: {stats['total_nonempty']}")
             print(f"  • Total bios classified: {stats['total_classified']}")
             print(f"  • Total matches found: {stats['total_yes']}")
             print(f"  • Queue status: usernames={username_queue.qsize()} bios={bio_queue.qsize()}")
@@ -715,12 +783,14 @@ class InstagramScraper:
                     print(f"⏰ Timeout approaching ({elapsed_time:.1f}s elapsed, {timeout_seconds}s limit). Returning partial results.")
                     break
                 
-                # Collect visible handles
-                for h in await user_links.all_inner_texts():
-                    h = h.strip()
-                    if h and h not in seen_handles:
-                        seen_handles.add(h)
-                        batch_handles.append(h)
+                # Collect visible handles from href attributes
+                elements = await user_links.element_handles()
+                for el in elements:
+                    href = await el.get_attribute("href")
+                    username = self._parse_username_from_href(href)
+                    if username and username not in seen_handles:
+                        seen_handles.add(username)
+                        batch_handles.append(username)
 
                 # Check progress
                 new_total = len(seen_handles)
