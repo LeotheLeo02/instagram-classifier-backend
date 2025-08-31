@@ -33,9 +33,22 @@ class ScraperConfig:
     # Use bounded queues to prevent unbounded memory growth under backpressure
     USERNAME_QUEUE_MAXSIZE = 20
     BIO_QUEUE_MAXSIZE = 200
+    # Optional watermarks for bio queue to avoid overproduction upstream
+    BIO_QUEUE_HIGH_WATERMARK = 100
+    BIO_QUEUE_LOW_WATERMARK = 20
+    # Watermarks to control API fetch cadence
+    USERNAME_QUEUE_LOW_WATERMARK = 2   # fetch another page when qsize <= LOW
+    USERNAME_QUEUE_HIGH_WATERMARK = 8  # optional: slow down if qsize >= HIGH
 
     # Overall safety timeout for a single scrape run (seconds)
     SCRAPE_MAX_SECONDS = 3600
+    
+    # Instagram web API constants
+    IG_APP_ID = "936619743392459"
+    # Followers GraphQL query hash used by Instagram web to list followers
+    FOLLOWERS_QUERY_HASH = "5aefa9893005572d237da5068082d8d5"
+    # Typical page size returned by the followers GraphQL API (12 or 24)
+    API_PAGE_SIZE = 24
     
     # Christian symbols for bio validation
     CHRISTIAN_SYMBOLS = {
