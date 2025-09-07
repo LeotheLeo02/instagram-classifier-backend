@@ -21,7 +21,8 @@ class ScraperConfig:
     MAX_IDLE_LOOPS = 10
     
     # HTTP timeout
-    HTTPX_LONG_TIMEOUT = httpx.Timeout(connect=30.0, write=30.0, read=10_000.0, pool=None)
+    # Reduce read timeout to avoid long stalls on remote classifier
+    HTTPX_LONG_TIMEOUT = httpx.Timeout(connect=30.0, write=30.0, read=30.0, pool=None)
     
     # Classification settings
     CLASSIFICATION_CHUNK_SIZE = 10

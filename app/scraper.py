@@ -247,91 +247,6 @@ class InstagramScraper:
         
         return all_bios
     
-    async def _process_bio_batch(
-        self, 
-        bios: List[Dict], 
-        client: httpx.AsyncClient,
-        criteria_text: str | None = None,
-    ) -> List[Dict]:
-        """Process a batch of bios through validation and classification."""
-        # Validate and clean bios
-        valid_bios = []
-        for bio in bios:
-            cleaned_bio = BioValidator.validate_and_clean_bio(bio)
-            if cleaned_bio:
-                valid_bios.append(cleaned_bio)
-        
-        # Log filtering results
-        original_count = len(bios)
-        filtered_count = len(valid_bios)
-        if original_count != filtered_count:
-            print(f"📊 Bio filtering: {original_count} -> {filtered_count} valid bios (removed {original_count - filtered_count} invalid)")
-        
-        if not valid_bios:
-            return []
-        
-        # Process bios in chunks for classification
-        all_flags = []
-        chunk_success_count = 0
-        
-        for i in range(0, len(valid_bios), ScraperConfig.CLASSIFICATION_CHUNK_SIZE):
-            chunk = valid_bios[i:i + ScraperConfig.CLASSIFICATION_CHUNK_SIZE]
-            chunk_num = i // ScraperConfig.CLASSIFICATION_CHUNK_SIZE + 1
-            try:
-                print(f"🔎 [DEBUG] Classifying chunk {chunk_num} (size={len(chunk)}) with custom criteria={bool(criteria_text and criteria_text.strip())}")
-                chunk_flags = await self.bio_classifier.classify_bios(
-                    [b["bio"] for b in chunk], client, criteria_text=criteria_text
-                )
-                all_flags.extend(chunk_flags)
-                chunk_success_count += 1
-            except Exception as e:
-                print(f"⚠️ Chunk {chunk_num} classification failed: {e}")
-                all_flags.extend([""] * len(chunk))
-        
-        print(f"✅ Successfully classified {chunk_success_count} chunks")
-        
-        # Process classification results using chunk-based tracking
-        yes_idx = set()
-        
-        # Calculate how many complete chunks we have
-        total_chunks = (len(valid_bios) + ScraperConfig.CLASSIFICATION_CHUNK_SIZE - 1) // ScraperConfig.CLASSIFICATION_CHUNK_SIZE
-        
-        for chunk_index in range(total_chunks):
-            # Calculate the global offset for this chunk
-            chunk_offset = chunk_index * ScraperConfig.CLASSIFICATION_CHUNK_SIZE
-            
-            # Calculate actual chunk size (handles last chunk that might be smaller)
-            chunk_start_pos = chunk_index * ScraperConfig.CLASSIFICATION_CHUNK_SIZE
-            chunk_end_pos = min(chunk_start_pos + ScraperConfig.CLASSIFICATION_CHUNK_SIZE, len(valid_bios))
-            actual_chunk_size = chunk_end_pos - chunk_start_pos
-            
-            # Get flags for this chunk
-            flags_start = chunk_index * ScraperConfig.CLASSIFICATION_CHUNK_SIZE
-            flags_end = flags_start + actual_chunk_size
-            chunk_flags = all_flags[flags_start:flags_end]
-            
-            # Process each flag in the chunk
-            for flag in chunk_flags:  # Fixed: removed enumerate
-                if flag and flag.isdigit():
-                    # Convert local index to global index using chunk offset
-                    global_idx = chunk_offset + int(flag)
-                    if 0 <= global_idx < len(valid_bios):
-                        yes_idx.add(global_idx)
-        
-        # Return "yes" results
-        yes_results = []
-        for idx in yes_idx:
-            if (idx < len(valid_bios) and 
-                valid_bios[idx]["bio"] and 
-                valid_bios[idx]["username"]):
-                yes_results.append({
-                    "username": valid_bios[idx]["username"],
-                    "url": f"https://www.instagram.com/{valid_bios[idx]['username']}/",
-                    "bio": valid_bios[idx]["bio"]
-                })
-        
-        return yes_results
-    
     async def _scrape_followers_parallel(
         self,
         context,
@@ -368,6 +283,42 @@ class InstagramScraper:
             "total_classified": 0,
             "total_yes": 0
         }
+
+        # Progress meta update throttling and helpers
+        last_meta_update_ts: float = 0.0
+        last_yes_reported: int = -1
+        started_at_epoch: int = int(time.time())
+        effective_exec_id = self.exec_id or os.getenv("EXEC_ID") or os.getenv("SCRAPE_EXEC_ID") or ""
+        prefix_for_meta: str = self._gcs_prefix(target, effective_exec_id) if effective_exec_id else self._gcs_prefix(target, self.exec_id or "")
+
+        def _maybe_update_progress_meta(force: bool = False) -> None:
+            nonlocal last_meta_update_ts, last_yes_reported
+            try:
+                now = time.time()
+                yes_count = int(stats.get("total_yes", 0))
+                # Update if forced, yes_count changed, or 5s elapsed
+                if not force and yes_count == last_yes_reported and (now - last_meta_update_ts) < 5.0:
+                    return
+                meta_running = {
+                    "status": "running",
+                    "target": target,
+                    "target_yes": int(target_yes),
+                    "yes_count": yes_count,
+                    "total_scraped": int(stats.get("total_scraped", 0)),
+                    "total_fetched": int(stats.get("total_fetched", 0)),
+                    "total_nonempty": int(stats.get("total_nonempty", 0)),
+                    "total_classified": int(stats.get("total_classified", 0)),
+                    "started_at": started_at_epoch,
+                    "operation_id": self.exec_id,
+                    "updated_at": int(now),
+                }
+                # Best-effort upload; ignore failures
+                self._upload_json_to_gcs(meta_running, prefix_for_meta + "meta.json")
+                last_meta_update_ts = now
+                last_yes_reported = yes_count
+            except Exception:
+                # Never fail the scrape due to progress updates
+                pass
         
         async def _resolve_user_id(page: Page, username: str) -> Optional[str]:
             """Resolve numeric user id for a username using the profile JSON or web_profile_info fallback."""
@@ -724,22 +675,39 @@ class InstagramScraper:
                     except asyncio.TimeoutError:
                         # Process partial batch if we have any
                         if batch_buffer:
-                            await process_classification_batch(batch_buffer, client, criteria_text)
-                            batch_buffer = []
+                            print(f"[classifier] starting partial batch (size={len(batch_buffer)}) after timeout")
+                            try:
+                                await asyncio.wait_for(process_classification_batch(batch_buffer, client, criteria_text), timeout=30)
+                                print("[classifier] finished partial batch")
+                            except asyncio.TimeoutError:
+                                print("[classifier] partial batch timed out; skipping")
+                            finally:
+                                batch_buffer = []
                         continue
 
                     if bio is None:  # End signal
                         print("[classifier] got sentinel; processing remaining batch and exiting")
                         if batch_buffer:
-                            await process_classification_batch(batch_buffer, client, criteria_text)
+                            print(f"[classifier] starting final batch (size={len(batch_buffer)})")
+                            try:
+                                await asyncio.wait_for(process_classification_batch(batch_buffer, client, criteria_text), timeout=30)
+                                print("[classifier] finished final batch")
+                            except asyncio.TimeoutError:
+                                print("[classifier] final batch timed out; skipping")
                         break
 
                     batch_buffer.append(bio)
 
                     # Process when we have a full batch
                     if len(batch_buffer) >= ScraperConfig.CLASSIFICATION_CHUNK_SIZE:
-                        await process_classification_batch(batch_buffer, client, criteria_text)
-                        batch_buffer = []
+                        print(f"[classifier] starting batch (size={len(batch_buffer)})")
+                        try:
+                            await asyncio.wait_for(process_classification_batch(batch_buffer, client, criteria_text), timeout=30)
+                            print("[classifier] finished batch")
+                        except asyncio.TimeoutError:
+                            print("[classifier] batch timed out; skipping")
+                        finally:
+                            batch_buffer = []
 
             except Exception as e:
                 print(f"Bio classifier error: {e}")
@@ -775,7 +743,12 @@ class InstagramScraper:
                             if stats["total_yes"] >= target_yes:
                                 print(f"[stop] classifier: target met ({stats['total_yes']}/{target_yes}); setting stop_event")
                                 stop_event.set()
+                                # Final progress update before returning
+                                _maybe_update_progress_meta(force=True)
                                 return
+
+                # Update running progress after processing batch
+                _maybe_update_progress_meta(force=False)
 
             except Exception as e:
                 print(f"Classification batch error: {e}")
