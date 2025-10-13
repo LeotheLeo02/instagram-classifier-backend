@@ -10,17 +10,18 @@ This module provides functionality to:
 """
 
 import asyncio
-import math
-import os
-import time
 import json
+import os
+import random
 import re
 import tempfile
+import time
 from pathlib import Path
-from typing import List, Dict, Optional, Set
+from typing import Any, Dict, Iterable, List, Optional, Set
 
 import httpx
-from playwright.async_api import Browser, Page, TimeoutError as PlayTimeout
+from google.cloud import storage
+from playwright.async_api import Browser, Page, TimeoutError as PlayTimeout, Error as PlaywrightError
 
 # Try to import playwright-stealth for enhanced anti-detection
 try:
@@ -35,6 +36,7 @@ from .validators import BioValidator
 from .exporters import CSVExporter
 from .classifiers import BioClassifier
 from .notifications import NotificationService
+from .ratelimit import RateLimiter, with_retry
 
 
 class InstagramScraper:
@@ -48,11 +50,51 @@ class InstagramScraper:
         # Preferred exec_id comes from caller/env so backend/launcher can pre-select folder
         # Fallback to None; we'll generate if still missing when needed
         self.exec_id = exec_id or os.getenv("EXEC_ID") or os.getenv("SCRAPE_EXEC_ID")
+        self._rl_graphql = RateLimiter(
+            ScraperConfig.GRAPHQL_QPS,
+            ScraperConfig.GRAPHQL_BURST,
+            "graphql",
+        )
+        self._rl_profile = RateLimiter(
+            ScraperConfig.PROFILE_QPS,
+            ScraperConfig.PROFILE_BURST,
+            "profile",
+        )
+        self._last_429_at: Optional[float] = None
+        self._last_5xx_at: Optional[float] = None
+        self._throttle_events: int = 0
+        self._server_error_events: int = 0
+        self._last_metrics_report: float = 0.0
+        self._rolling_latency: float = 0.0
+        self._last_latency_report: float = 0.0
 
     def _gcs_prefix(self, target: str, operation_id: str) -> str:
         """Stable prefix for result artifacts in GCS."""
         # e.g., scrapes/<target>/<op_1722980000>/
         return f"scrapes/{target}/{operation_id}/"
+
+    def _update_latency_metric(self, previous: float, latest: float) -> float:
+        smoothing = ScraperConfig.LATENCY_SMOOTHING
+        if previous <= 0:
+            return latest
+        return (1.0 - smoothing) * previous + smoothing * latest
+
+    def _log_latency(self, name: str, latest_value: float) -> None:
+        now = time.time()
+        if now - self._last_latency_report < 15.0:
+            return
+        print(f"[metrics] {name} rolling latency ~ {latest_value:.2f}s")
+        self._last_latency_report = now
+
+    def _note_throttle(self, name: str, attempt: int) -> None:
+        self._throttle_events += 1
+        self._last_429_at = time.time()
+        print(f"[metrics] {name} received 429 on attempt {attempt+1}")
+
+    def _note_server_error(self, name: str, attempt: int) -> None:
+        self._server_error_events += 1
+        self._last_5xx_at = time.time()
+        print(f"[metrics] {name} server error on attempt {attempt+1}")
 
     def _upload_json_to_gcs(self, obj, destination_blob: str) -> Optional[str]:
         """Serialize obj to a temp JSON file and upload to GCS via CSVExporter.
@@ -100,6 +142,53 @@ class InstagramScraper:
             # Non-fatal; scraping can still proceed even if pre-create fails
             pass
         return self.exec_id
+
+    def _followers_page_blob(self, target: str) -> str:
+        return f"followers-cache/{target}/page.json"
+
+    async def _load_cached_followers_page(self, target: str) -> Optional[Dict[str, Any]]:
+        if not self.gcs_bucket:
+            return None
+        try:
+            loop = asyncio.get_running_loop()
+            client = storage.Client()
+            bucket = client.bucket(self.gcs_bucket)
+            blob = bucket.blob(self._followers_page_blob(target))
+            exists = await loop.run_in_executor(None, blob.exists)
+            if not exists:
+                return None
+            data = await loop.run_in_executor(None, blob.download_as_text)
+            return json.loads(data)
+        except Exception as exc:
+            print(f"⚠️ Failed to load cached followers page for {target}: {exc}")
+            return None
+
+    async def _save_followers_page(self, target: str, entries: Iterable[str], next_cursor: Optional[str]) -> None:
+        if not self.gcs_bucket:
+            return
+        payload = {
+            "followers": list(entries),
+            "next_cursor": next_cursor,
+            "updated_at": int(time.time()),
+        }
+        blob_name = self._followers_page_blob(target)
+        loop = asyncio.get_running_loop()
+        tmp_path: Optional[str] = None
+        try:
+            client = storage.Client()
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".json", delete=False) as tf:
+                json.dump(payload, tf, ensure_ascii=False)
+                tmp_path = tf.name
+            await loop.run_in_executor(
+                None,
+                lambda: client.bucket(self.gcs_bucket).blob(blob_name).upload_from_filename(tmp_path),
+            )
+        finally:
+            try:
+                if tmp_path:
+                    os.remove(tmp_path)
+            except OSError:
+                pass
     
     @staticmethod
     def format_duration(seconds: float) -> str:
@@ -165,11 +254,14 @@ class InstagramScraper:
     async def _get_bio(self, page: Page, username: str) -> str:
         """Extract bio from a user's profile page."""
         try:
+            await self._rl_profile.acquire()
             await page.goto(
                 f"https://www.instagram.com/{username}/",
                 timeout=ScraperConfig.BIO_PAGE_TIMEOUT_MS,
                 wait_until="domcontentloaded",
             )
+            await asyncio.sleep(0.2 + random.random() * 0.4)
+            print(f"[bio] navigated to profile for {username}")
             
             # Check for security challenges
             challenge_indicators = [
@@ -189,63 +281,97 @@ class InstagramScraper:
                     raise RuntimeError("CAPTCHA or challenge detected")
                     
         except PlayTimeout:
+            print(f"[bio] timeout while loading profile for {username}")
             return ""
-        except Exception:
+        except Exception as exc:
+            print(f"[bio] error loading profile for {username}: {exc}")
             return ""
 
         try:
             desc = await page.get_attribute("head meta[name='description']", "content")
             if desc and " on Instagram: " in desc:
-                return desc.split(" on Instagram: ")[1].strip().strip('"')
-        except Exception:
-            pass
+                bio_text = desc.split(" on Instagram: ")[1].strip().strip('"')
+                preview = bio_text[:80].replace("\n", " ")
+                print(f"[bio] extracted bio for {username}: {preview}")
+                return bio_text
+            else:
+                print(f"[bio] meta description missing expected pattern for {username}: {desc}")
+        except Exception as exc:
+            print(f"[bio] error extracting meta description for {username}: {exc}")
         return ""
     
-    async def _get_bios_for_chunk(self, bio_page: Page, usernames: List[str]) -> List[Dict]:
-        """Fetch bios for a chunk of usernames using a single bio page."""
-        bios = []
-        for username in usernames:
+    async def _get_bio_api_first(self, page: Page, username: str) -> str:
+        """Attempt lightweight web_profile_info before falling back to full page navigation."""
+        try:
+            url = f"https://i.instagram.com/api/v1/users/web_profile_info/?username={username}"
+            resp = await with_retry(
+                lambda: page.request.get(
+                    url,
+                    headers={
+                        "X-IG-App-ID": ScraperConfig.IG_APP_ID,
+                        "Referer": f"https://www.instagram.com/{username}/",
+                    },
+                ),
+                limiter=self._rl_graphql,
+                what=f"web_profile_info for {username}",
+                hard_penalty_factor=ScraperConfig.RATE_LIMIT_PENALTY_FACTOR,
+                hard_penalty_seconds=ScraperConfig.RATE_LIMIT_PENALTY_SECONDS,
+                soft_penalty_factor=ScraperConfig.RATE_LIMIT_PENALTY_SOFT_FACTOR,
+                soft_penalty_seconds=ScraperConfig.RATE_LIMIT_PENALTY_SOFT_SECONDS,
+                on_429=lambda attempt: self._note_throttle("web_profile_info", attempt),
+                on_5xx=lambda attempt: self._note_server_error("web_profile_info", attempt),
+            )
+            if resp.status == 200:
+                data = await resp.json()
+                bio = ((data.get("data") or {}).get("user") or {}).get("biography") or ""
+                if bio:
+                    return bio
+        except Exception:
+            pass
+
+        return await self._get_bio(page, username)
+
+    async def _ensure_bio_pages_alive(self, context, bio_pages: List[Page]) -> List[Page]:
+        alive: List[Page] = []
+        total_expected = len(bio_pages)
+
+        for page in bio_pages:
             try:
-                bio = await self._get_bio(bio_page, username)
-            except RuntimeError:
-                bio = ""
-            bios.append({"username": username, "bio": bio})
-        return bios
-    
-    async def _get_bios_parallel(self, bio_pages: List[Page], usernames: List[str]) -> List[Dict]:
-        """Fetch bios for multiple usernames in parallel using multiple bio pages."""
-        if not usernames:
-            return []
-        
-        num_bio_pages = len(bio_pages)
-        
-        # Split usernames across bio pages (more even distribution)
-        chunk_size = max(1, math.ceil(len(usernames) / num_bio_pages))
-        chunks_list = [usernames[i:i + chunk_size] for i in range(0, len(usernames), chunk_size)]
-        
-        # Create tasks for each chunk with proper error handling
-        tasks = []
-        for i, chunk in enumerate(chunks_list):
-            if chunk:
-                task = asyncio.create_task(
-                    self._get_bios_for_chunk(bio_pages[i % num_bio_pages], chunk)
-                )
-                tasks.append(task)
-        
-        # Wait for all tasks to complete
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # Flatten results and handle any exceptions with proper chunk sizes
-        all_bios = []
-        for result, chunk in zip(results, chunks_list):
-            if isinstance(result, Exception):
-                print(f"⚠️ Error in bio fetching: {result}")
-                # Skip this chunk; do not enqueue empty placeholders
+                if page and not page.is_closed():
+                    alive.append(page)
+            except PlaywrightError:
                 continue
+
+        context_open = False
+        if context:
+            is_closed_method = getattr(context, "is_closed", None)
+            if callable(is_closed_method):
+                try:
+                    context_open = not context.is_closed()
+                except PlaywrightError:
+                    context_open = False
             else:
-                all_bios.extend(result)
-        
-        return all_bios
+                try:
+                    _ = context.pages
+                    context_open = True
+                except PlaywrightError:
+                    context_open = False
+
+        if context_open and total_expected > len(alive):
+            for _ in range(total_expected - len(alive)):
+                try:
+                    new_page = await context.new_page()
+                except PlaywrightError as e:
+                    print(f"[fetcher] failed to create replacement bio page ({type(e).__name__}: {e})")
+                    break
+                if STEALTH_AVAILABLE:
+                    try:
+                        await stealth_async(new_page)
+                    except Exception as e:
+                        print(f"[fetcher] stealth setup failed ({e}); continuing without stealth")
+                alive.append(new_page)
+
+        return alive
     
     async def _scrape_followers_parallel(
         self,
@@ -284,12 +410,65 @@ class InstagramScraper:
             "total_yes": 0
         }
 
+        cached_followers_page = await self._load_cached_followers_page(target)
+        persisted_followers: List[str] = []
+        persisted_followers_set: Set[str] = set()
+        stored_next_cursor: Optional[str] = None
+        rolling_latency: float = 0.0
+
+        if cached_followers_page:
+            cached_list = [
+                handle.strip()
+                for handle in cached_followers_page.get("followers", []) or []
+                if isinstance(handle, str) and handle.strip()
+            ]
+            persisted_followers.extend(cached_list)
+            persisted_followers_set.update(cached_list)
+            stored_next_cursor = cached_followers_page.get("next_cursor") or None
+            print(
+                f"[cache] Loaded {len(cached_list)} cached followers for @{target}"
+                + (" with next_cursor" if stored_next_cursor else "")
+            )
+
+        followers_page_state = {
+            "dirty": False,
+            "last_save_ts": 0.0,
+        }
+
+        def should_feed_followers() -> bool:
+            return (
+                username_queue.qsize() <= ScraperConfig.USERNAME_QUEUE_LOW_WATERMARK
+                and bio_queue.qsize() <= ScraperConfig.BIO_QUEUE_LOW_WATERMARK
+            )
+
+        async def persist_followers_page_if_needed(force: bool = False) -> None:
+            if not self.gcs_bucket:
+                return
+            now = time.time()
+            if not force and not followers_page_state["dirty"]:
+                return
+            if not force and (now - followers_page_state["last_save_ts"]) < 5.0:
+                return
+            try:
+                await self._save_followers_page(target, persisted_followers, stored_next_cursor)
+                followers_page_state["dirty"] = False
+                followers_page_state["last_save_ts"] = now
+            except Exception as exc:
+                print(f"⚠️ Failed to persist followers page for {target}: {exc}")
+            else:
+                print(f"[cache] persisted {len(persisted_followers)} cached followers for @{target} cursor={'set' if stored_next_cursor else 'none'}")
+
+        async def _flush_followers_cache_final() -> None:
+            await persist_followers_page_if_needed(force=True)
+
         # Progress meta update throttling and helpers
         last_meta_update_ts: float = 0.0
         last_yes_reported: int = -1
         started_at_epoch: int = int(time.time())
         effective_exec_id = self.exec_id or os.getenv("EXEC_ID") or os.getenv("SCRAPE_EXEC_ID") or ""
         prefix_for_meta: str = self._gcs_prefix(target, effective_exec_id) if effective_exec_id else self._gcs_prefix(target, self.exec_id or "")
+
+        # cooldown handling disabled
 
         def _maybe_update_progress_meta(force: bool = False) -> None:
             nonlocal last_meta_update_ts, last_yes_reported
@@ -321,7 +500,7 @@ class InstagramScraper:
                 pass
         
         async def _resolve_user_id(page: Page, username: str) -> Optional[str]:
-            """Resolve numeric user id for a username using the profile JSON or web_profile_info fallback."""
+            """Resolve numeric user id for a username using the profile JSON or web_profile_info endpoint."""
             try:
                 print(f"[api] resolving user id for {username} via profile page")
                 await page.goto(f"https://www.instagram.com/{username}/", wait_until="domcontentloaded")
@@ -350,22 +529,29 @@ class InstagramScraper:
                             print(f"[api] resolved user id from profile JSON: {uid}")
                             return str(uid)
                     except Exception as exc:
-                        print(f"[api] profile JSON parse failed; will fallback. error={exc}")
+                        print(f"[api] profile JSON parse failed; continuing to alternate lookup. error={exc}")
             except Exception as exc:
                 print(f"[api] error loading profile page for id resolve: {exc}")
 
-            # Fallback to web_profile_info with cookies/headers
+            # Query web_profile_info with cookies/headers for a direct lookup
             try:
-                cookies = await page.context.cookies()
-                csrf = next((c.get("value") for c in cookies if c.get("name") == "csrftoken" and "instagram.com" in c.get("domain","")), "")
                 url = f"https://i.instagram.com/api/v1/users/web_profile_info/?username={username}"
-                resp = await page.request.get(
-                    url,
-                    headers={
-                        "X-IG-App-ID": ScraperConfig.IG_APP_ID,
-                        "X-CSRFToken": csrf,
-                        "Referer": f"https://www.instagram.com/{username}/",
-                    },
+                resp = await with_retry(
+                    lambda: page.request.get(
+                        url,
+                        headers={
+                            "X-IG-App-ID": ScraperConfig.IG_APP_ID,
+                            "Referer": f"https://www.instagram.com/{username}/",
+                        },
+                    ),
+                    limiter=self._rl_graphql,
+                    what=f"web_profile_info for {username}",
+                    hard_penalty_factor=ScraperConfig.RATE_LIMIT_PENALTY_FACTOR,
+                    hard_penalty_seconds=ScraperConfig.RATE_LIMIT_PENALTY_SECONDS,
+                    soft_penalty_factor=ScraperConfig.RATE_LIMIT_PENALTY_SOFT_FACTOR,
+                    soft_penalty_seconds=ScraperConfig.RATE_LIMIT_PENALTY_SOFT_SECONDS,
+                    on_429=lambda attempt: self._note_throttle("web_profile_info", attempt),
+                            on_5xx=lambda attempt: self._note_server_error("web_profile_info", attempt),
                 )
                 if resp.status != 200:
                     try:
@@ -381,151 +567,116 @@ class InstagramScraper:
                     print(f"[api] resolved user id from web_profile_info: {uid}")
                     return str(uid)
             except Exception as exc:
-                print(f"[api] error in web_profile_info fallback: {exc}")
+                print(f"[api] error in web_profile_info lookup: {exc}")
             return None
-
-        async def username_producer_scroll():
-            """Continuously scrape usernames from the followers dialog (UI scroll fallback)."""
-            try:
-                # Navigate to target profile
-                await followers_page.goto(f"https://www.instagram.com/{target}/")
-
-                # Open followers dialog
-                link = followers_page.locator('header a[href*="/followers"]')
-                followers_page.set_default_timeout(25_000)
-
-                await followers_page.wait_for_selector('header a[href*="/followers"]', state="attached")
-                await link.wait_for(state="visible")
-                await link.click()
-                await followers_page.wait_for_selector(
-                    'div[role="dialog"]',
-                    timeout=ScraperConfig.DIALOG_SELECTOR_TIMEOUT_MS,
-                )
-
-                dialog = followers_page.locator('div[role="dialog"]').last
-                first_link = dialog.locator('a[href^="/"]').first
-                await first_link.wait_for(
-                    state="attached",
-                    timeout=ScraperConfig.FIRST_LINK_WAIT_TIMEOUT_MS,
-                )
-
-                user_links = dialog.locator('a[href^="/"]')
-
-                seen_handles = set()
-                idle_loops = 0
-                previous_count = 0
-
-                while not stop_event.is_set():
-                    # Collect visible handles from href attributes (more reliable than link text)
-                    current_batch = []
-                    elements = await user_links.element_handles()
-                    for el in elements:
-                        href = await el.get_attribute("href")
-                        username = self._parse_username_from_href(href)
-                        if username and username not in seen_handles:
-                            seen_handles.add(username)
-                            current_batch.append(username)
-
-                            # Put usernames in queue as we find them
-                            if len(current_batch) >= batch_size:
-                                # Backpressure: await if the queue is full
-                                await username_queue.put(current_batch[:batch_size])
-                                current_batch = current_batch[batch_size:]
-                                stats["total_scraped"] += batch_size
-
-                    # Check progress
-                    new_total = len(seen_handles)
-                    if new_total == previous_count:
-                        idle_loops += 1
-                        if idle_loops >= ScraperConfig.MAX_IDLE_LOOPS:
-                            print(f"[stop] producer: no new followers after {ScraperConfig.MAX_IDLE_LOOPS} scrolls; setting stop_event and exiting")
-                            # Flush any remaining current_batch before exiting
-                            if current_batch:
-                                await username_queue.put(current_batch)
-                                stats["total_scraped"] += len(current_batch)
-                                current_batch = []
-                            stop_event.set()
-                            break
-                    else:
-                        idle_loops = 0
-                    previous_count = new_total
-
-                    # Scroll
-                    try:
-                        await user_links.nth(-1).scroll_into_view_if_needed()
-                    except PlayTimeout:
-                        print("[stop] producer: scroll timeout - likely end of list; setting stop_event and exiting")
-                        # Flush any remaining current_batch before exiting
-                        if current_batch:
-                            await username_queue.put(current_batch)
-                            stats["total_scraped"] += len(current_batch)
-                            current_batch = []
-                        stop_event.set()
-                        break
-
-                    # Dynamic wait
-                    wait_time = ScraperConfig.IDLE_SCROLL_WAIT if idle_loops > 0 else ScraperConfig.BASE_SCROLL_WAIT
-                    await asyncio.sleep(wait_time)
-
-                    # Put remaining batch if any
-                    if current_batch:
-                        await username_queue.put(current_batch)
-                        stats["total_scraped"] += len(current_batch)
-
-            except Exception as e:
-                print(f"Username producer error: {e}")
-            finally:
-                # Signal end of production (avoid blocking if queue is full)
-                try:
-                    username_queue.put_nowait(None)
-                except Exception:
-                    try:
-                        await asyncio.wait_for(username_queue.put(None), timeout=1.0)
-                    except Exception:
-                        print("[producer] failed to send sentinel; username_queue may be full")
-                print("[producer] sent sentinel None to username_queue")
 
         async def username_producer_api(user_id: str):
             """Produce usernames by paging Instagram's followers GraphQL API using page cookies.
             Caps total produced usernames at target_yes (API limit), batching by batch_size.
-            Falls back to scroll producer if API errors or yields no edges.
             """
-            after = None
+            print("Calling API Consumer")
+            nonlocal stored_next_cursor
+            cache_drained_reported = False
+            after = stored_next_cursor
+            cache_count = len(persisted_followers)
+            print(
+                f"[api] cache entries available: {cache_count} stored_cursor={'set' if stored_next_cursor else 'none'}"
+            )
             seen_handles: Set[str] = set()
             first = ScraperConfig.API_PAGE_SIZE
             # Buffer of usernames from the last fetched API page; we trickle them into the queue
             buffered_usernames: List[str] = []
             try:
-                # Collect CSRF from context cookies
-                cookies = await followers_page.context.cookies()
-                csrf = next((c.get("value") for c in cookies if c.get("name") == "csrftoken" and "instagram.com" in c.get("domain","")), "")
-                if not csrf:
-                    print("[api] no csrftoken cookie found; falling back to scroll")
-                    return await username_producer_scroll()
+                cached_idx = 0
+                rolling_latency: float = 0.0
+                paused = False
+                last_pause_log = 0.0
+                PAUSE_LOG_INTERVAL = 5.0
+
+                def log_pause_once() -> None:
+                    nonlocal paused, last_pause_log
+                    now = time.monotonic()
+                    if (not paused) or (now - last_pause_log) >= PAUSE_LOG_INTERVAL:
+                        print(
+                            f"[api][cache] paused feed: cached_idx={cached_idx} "
+                            f"cache_len={len(persisted_followers)} "
+                            f"username_qsize={username_queue.qsize()} "
+                            f"bio_qsize={bio_queue.qsize()} "
+                            f"(low_wm_u={ScraperConfig.USERNAME_QUEUE_LOW_WATERMARK}, "
+                            f"low_wm_b={ScraperConfig.BIO_QUEUE_LOW_WATERMARK})"
+                        )
+                        paused = True
+                        last_pause_log = now
+
+                def log_resume_once() -> None:
+                    nonlocal paused
+                    if paused:
+                        print(f"[api][cache] resumed feed at idx={cached_idx}")
+                        paused = False
+
+                async def _feed_cached() -> bool:
+                    nonlocal cached_idx, cache_drained_reported
+                    added = False
+                    while cached_idx < len(persisted_followers):
+                        if not should_feed_followers():
+                            break
+                        chunk = persisted_followers[cached_idx:cached_idx + batch_size]
+                        if not chunk:
+                            break
+                        cached_idx += len(chunk)
+                        print(
+                            f"[api][cache] enqueued {len(chunk)} cached usernames (remaining={len(persisted_followers) - cached_idx})"
+                        )
+                        for username_val in chunk:
+                            await username_queue.put(username_val)
+                            stats["total_scraped"] += 1
+                            added = True
+                    if not added and cached_idx >= len(persisted_followers) and not cache_drained_reported:
+                        print("[api][cache] cache exhausted; waiting on fresh API data")
+                        cache_drained_reported = True
+                    return added
 
                 while not stop_event.is_set():
-                    # 1) Trickle from buffer into queue while queue needs it
+                    if not should_feed_followers():
+                        log_pause_once()
+                        await asyncio.sleep(0.5)
+                        continue
+
+                    log_resume_once()
+
                     while buffered_usernames and not stop_event.is_set():
-                        # Respect low/high watermarks
-                        if (username_queue.qsize() >= ScraperConfig.USERNAME_QUEUE_HIGH_WATERMARK or 
-                            bio_queue.qsize() >= ScraperConfig.BIO_QUEUE_HIGH_WATERMARK):
-                            await asyncio.sleep(0.2)
-                            continue
-                        # Send next chunk from buffer
-                        chunk = buffered_usernames[:batch_size]
-                        buffered_usernames = buffered_usernames[batch_size:]
-                        if chunk:
-                            await username_queue.put(chunk)
-                            stats["total_scraped"] += len(chunk)
+                        if not should_feed_followers():
+                            log_pause_once()
+                            break
+                        username_val = buffered_usernames.pop(0)
+                        await username_queue.put(username_val)
+                        stats["total_scraped"] += 1
 
                     if stop_event.is_set():
                         break
 
-                    # 2) Only fetch a new API page if the queue is low and buffer is empty
-                    if (buffered_usernames or 
-                        username_queue.qsize() > ScraperConfig.USERNAME_QUEUE_LOW_WATERMARK or 
-                        bio_queue.qsize() > ScraperConfig.BIO_QUEUE_LOW_WATERMARK):
-                        await asyncio.sleep(0.2)
+                    if buffered_usernames:
+                        await asyncio.sleep(0)
+                        continue
+
+                    if not should_feed_followers():
+                        log_pause_once()
+                        await asyncio.sleep(0.5)
+                        continue
+
+                    if await _feed_cached():
+                        await asyncio.sleep(0)
+                        continue
+
+                    if cached_idx >= len(persisted_followers) and not cache_drained_reported:
+                        print(
+                            f"[api][cache] no cached followers available (cached_idx={cached_idx})"
+                        )
+                        cache_drained_reported = True
+
+                    if not should_feed_followers():
+                        log_pause_once()
+                        await asyncio.sleep(0.5)
                         continue
 
                     variables = {
@@ -536,28 +687,60 @@ class InstagramScraper:
                     }
                     if after:
                         variables["after"] = after
+                    print("Using API to fetch followers")
                     url = (
                         f"https://www.instagram.com/graphql/query/?query_hash={ScraperConfig.FOLLOWERS_QUERY_HASH}"
                         f"&variables={json.dumps(variables, separators=(',',':'))}"
                     )
-                    print(f"[api] GraphQL GET: size={first} after={'yes' if after else 'no'} qsize={username_queue.qsize()}")
-                    resp = await followers_page.request.get(
-                        url,
-                        headers={
-                            "Referer": f"https://www.instagram.com/{target}/",
-                            "X-IG-App-ID": ScraperConfig.IG_APP_ID,
-                            "X-CSRFToken": csrf,
-                        },
-                    )
-                    if resp.status != 200:
+                    print(f"[api] GraphQL GET: size={first} after={'yes' if after else 'no'} qsize={username_queue.qsize()}" )
+                    self._log_latency("graphql", rolling_latency)
+                    try:
+                        start_req = time.monotonic()
+                        resp = await with_retry(
+                            lambda: followers_page.request.get(
+                                url,
+                                headers={
+                                    "Referer": f"https://www.instagram.com/{target}/",
+                                    "X-IG-App-ID": ScraperConfig.IG_APP_ID
+                                },
+                            ),
+                            limiter=self._rl_graphql,
+                            what="GraphQL followers page",
+                            hard_penalty_factor=ScraperConfig.RATE_LIMIT_PENALTY_FACTOR,
+                            hard_penalty_seconds=ScraperConfig.RATE_LIMIT_PENALTY_SECONDS,
+                            soft_penalty_factor=ScraperConfig.RATE_LIMIT_PENALTY_SOFT_FACTOR,
+                            soft_penalty_seconds=ScraperConfig.RATE_LIMIT_PENALTY_SOFT_SECONDS,
+                            on_429=lambda attempt: self._note_throttle("graphql", attempt),
+                            on_5xx=lambda attempt: self._note_server_error("graphql", attempt),
+                        )
+                        duration = time.monotonic() - start_req
+                        rolling_latency = self._update_latency_metric(
+                            rolling_latency,
+                            duration,
+                        )
+                    except Exception as api_error:
+                        print(f"[api] ❌ Error calling GraphQL API: {api_error}")
+                        await persist_followers_page_if_needed(force=True)
+                        await self.notification_service.send_notification(
+                            f"GraphQL followers fetch failed for @{target}: {api_error}",
+                            "Instagram Scraper - GraphQL Error",
+                        )
+                        raise
+
+                    try:
+                        data = await resp.json()
+                    except json.JSONDecodeError as decode_err:
                         try:
-                            snippet = (await resp.text() or "")[:500].replace("\n", " ")
+                            raw_body = await resp.text()
+                            snippet = (raw_body or "")[:500].replace("\n", " ")
                         except Exception:
                             snippet = "<unreadable>"
-                        print(f"[api] ❌ GraphQL non-200: {resp.status} snippet={snippet}; falling back to scroll")
-                        return await username_producer_scroll()
-
-                    data = await resp.json()
+                        print(
+                            f"[api] ❌ GraphQL JSON decode error: {decode_err} body_snippet={snippet}"
+                        )
+                        await persist_followers_page_if_needed(force=True)
+                        raise RuntimeError("GraphQL returned a non-JSON response") from decode_err
+                        
                     try:
                         edge_followed_by = data["data"]["user"]["edge_followed_by"]
                         edges = edge_followed_by["edges"]
@@ -567,12 +750,14 @@ class InstagramScraper:
                             snippet = json.dumps(data)[:500]
                         except Exception:
                             snippet = str(data)[:500]
-                        print(f"[api] ❌ JSON structure error: {exc} data={snippet}; falling back to scroll")
-                        return await username_producer_scroll()
+                        print(f"[api] ❌ JSON structure error: {exc} data={snippet}")
+                        await persist_followers_page_if_needed(force=True)
+                        raise RuntimeError("Unexpected GraphQL response structure") from exc
 
                     if not edges:
-                        print(f"[api] no edges returned; falling back to scroll")
-                        return await username_producer_scroll()
+                        print("[api] no edges returned from GraphQL")
+                        # Don't trigger password change for empty edges - might be end of followers
+                        raise RuntimeError("GraphQL returned no edges")
 
                     # Fill buffer with the entire page (deduped)
                     for edge in edges:
@@ -580,134 +765,211 @@ class InstagramScraper:
                         username_val = node.get("username")
                         if username_val and username_val not in seen_handles:
                             seen_handles.add(username_val)
+                            if username_val not in persisted_followers_set:
+                                persisted_followers.append(username_val)
+                                persisted_followers_set.add(username_val)
+                                followers_page_state["dirty"] = True
                             buffered_usernames.append(username_val)
 
                     if not page_info.get("has_next_page") or not page_info.get("end_cursor"):
                         print("[api] end of followers pages; stopping fetch; buffer will be drained")
                         # No more pages; we'll exit loop after buffer drains
                         after = None
+                        stored_next_cursor = None
                         # Keep looping to drain buffer
                     else:
                         after = page_info["end_cursor"]
+                        stored_next_cursor = after
+                        followers_page_state["dirty"] = True
                     await asyncio.sleep(0.2)
 
             except Exception as e:
-                print(f"[api] username producer error: {e}; falling back to scroll")
-                try:
-                    await username_producer_scroll()
-                    return
-                except Exception as e2:
-                    print(f"[api] fallback scroll also failed: {e2}")
+                print(f"[api] username producer error: {e}")
+                stop_event.set()
+                raise
             finally:
                 # Do not prematurely signal end; let shutdown phase send sentinels
                 pass
         
-        async def bio_fetcher():
-            """Continuously fetch bios for usernames from the queue."""
+        async def bio_worker(worker_id: int, page: Page, context):
+            """Worker that consumes usernames and fetches bios one at a time."""
             try:
                 while True:
                     try:
-                        usernames = await asyncio.wait_for(username_queue.get(), timeout=2.0)
+                        username = await asyncio.wait_for(username_queue.get(), timeout=2.0)
                     except asyncio.TimeoutError:
+                        if stop_event.is_set():
+                            break
                         continue
 
-                    if usernames is None:  # End signal
-                        print("[fetcher] got sentinel from producer; exiting fetch loop")
+                    if username is None:
+                        username_queue.task_done()
                         break
 
                     try:
-                        # Fetch bios in parallel using multiple pages
-                        bios = await self._get_bios_parallel(bio_pages, usernames)
+                        if not page or page.is_closed():
+                            if context and hasattr(context, "is_closed") and not context.is_closed():
+                                page = await context.new_page()
+                                if STEALTH_AVAILABLE:
+                                    try:
+                                        await stealth_async(page)
+                                    except Exception as e:
+                                        print(f"[bio-worker {worker_id}] stealth setup failed: {e}")
+                                if worker_id < len(bio_pages):
+                                    bio_pages[worker_id] = page
+                                else:
+                                    bio_pages.append(page)
+                            else:
+                                print(f"[bio-worker {worker_id}] context closed; stopping")
+                                stop_event.set()
+                                break
 
-                        # Track attempted bios (including empty)
-                        stats["total_fetched"] += len(bios)
+                        active_pages = await self._ensure_bio_pages_alive(context, bio_pages)
+                        bio_pages[:] = active_pages
+                        if not active_pages:
+                            print(f"[bio-worker {worker_id}] no bio pages available; stopping")
+                            stop_event.set()
+                            break
+                        if page not in active_pages or not page:
+                            idx = worker_id if worker_id < len(active_pages) else 0
+                            page = active_pages[idx]
 
-                        # Record all scraped bios (including empty bios) for parity with linear path
-                        if bios:
-                            async with results_lock:
-                                for b in bios:
-                                    if b and b.get("username"):
-                                        all_bios.append({
-                                            "username": b["username"],
-                                            "url": f"https://www.instagram.com/{b['username']}/",
-                                            "bio": b.get("bio", "")
-                                        })
+                        bio = await self._get_bio_api_first(page, username)
+                        stats["total_fetched"] += 1
+                        if bio:
+                            stats["total_nonempty"] += 1
+                            await bio_queue.put({"username": username, "bio": bio})
+                        else:
+                            print(f"[bio] empty bio returned for {username}")
 
-                        # Put only non-empty bios into the classification queue
-                        for bio in bios:
-                            if bio and bio.get("bio"):
-                                # Backpressure: await if the queue is full
-                                await bio_queue.put(bio)
-                                stats["total_nonempty"] += 1
+                        async with results_lock:
+                            all_bios.append({
+                                "username": username,
+                                "url": f"https://www.instagram.com/{username}/",
+                                "bio": bio or "",
+                            })
 
                     except Exception as e:
-                        print(f"Bio fetch error: {e}")
+                        print(f"[bio-worker {worker_id}] error for {username}: {e}")
                     finally:
                         username_queue.task_done()
-
-            except Exception as e:
-                print(f"Bio fetcher error: {e}")
             finally:
-                # Signal end of fetching (avoid blocking if queue is full)
-                try:
-                    bio_queue.put_nowait(None)
-                except Exception:
-                    try:
-                        await asyncio.wait_for(bio_queue.put(None), timeout=1.0)
-                    except Exception:
-                        print("[fetcher] failed to send sentinel; bio_queue may be full")
-                print("[fetcher] sent sentinel None to classifier")
+                print(f"[bio-worker {worker_id}] exiting")
         
         async def bio_classifier():
             """Continuously classify bios from the queue."""
             client = httpx.AsyncClient(timeout=ScraperConfig.HTTPX_LONG_TIMEOUT)
-            batch_buffer = []
+            batch_buffer: List[Dict] = []
+
+            async def _flush_batch(reason: str = "") -> None:
+                nonlocal batch_buffer
+                if not batch_buffer:
+                    return
+                if reason:
+                    print(
+                        f"[classifier] starting batch (size={len(batch_buffer)}) reason={reason}"
+                    )
+                try:
+                    await asyncio.wait_for(
+                        process_classification_batch(batch_buffer, client, criteria_text),
+                        timeout=30,
+                    )
+                    print("[classifier] finished batch")
+                except asyncio.TimeoutError:
+                    print("[classifier] batch timed out; skipping")
+                finally:
+                    batch_buffer = []
 
             try:
+                loop = asyncio.get_running_loop()
+
                 while True:
-                    # Exit promptly if target met and nothing left to process
                     if stop_event.is_set() and bio_queue.qsize() == 0 and not batch_buffer:
                         print("[classifier] stop_event set and queue empty; exiting")
                         break
-                    # Collect bios for batch classification
-                    try:
-                        bio = await asyncio.wait_for(bio_queue.get(), timeout=ScraperConfig.BATCH_FLUSH_TIMEOUT_SEC)
-                    except asyncio.TimeoutError:
-                        # Process partial batch if we have any
-                        if batch_buffer:
-                            print(f"[classifier] starting partial batch (size={len(batch_buffer)}) after timeout")
-                            try:
-                                await asyncio.wait_for(process_classification_batch(batch_buffer, client, criteria_text), timeout=30)
-                                print("[classifier] finished partial batch")
-                            except asyncio.TimeoutError:
-                                print("[classifier] partial batch timed out; skipping")
-                            finally:
-                                batch_buffer = []
-                        continue
 
-                    if bio is None:  # End signal
-                        print("[classifier] got sentinel; processing remaining batch and exiting")
-                        if batch_buffer:
-                            print(f"[classifier] starting final batch (size={len(batch_buffer)})")
-                            try:
-                                await asyncio.wait_for(process_classification_batch(batch_buffer, client, criteria_text), timeout=30)
-                                print("[classifier] finished final batch")
-                            except asyncio.TimeoutError:
-                                print("[classifier] final batch timed out; skipping")
+                    # 1) Wait for the FIRST item OR stop, whichever comes first
+                    bio_get = asyncio.create_task(bio_queue.get())
+                    stop_wait = asyncio.create_task(stop_event.wait())
+                    done, pending = await asyncio.wait(
+                        {bio_get, stop_wait},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+
+                    if stop_wait in done:
+                        print("[classifier] stop_event set during wait; flushing and exiting")
+                        bio_get.cancel()
+                        await _flush_batch("stop")
                         break
 
-                    batch_buffer.append(bio)
+                    bio = bio_get.result()
 
-                    # Process when we have a full batch
-                    if len(batch_buffer) >= ScraperConfig.CLASSIFICATION_CHUNK_SIZE:
-                        print(f"[classifier] starting batch (size={len(batch_buffer)})")
+                    if bio is None:
+                        print("[classifier] got sentinel; processing remaining batch and exiting")
+                        await _flush_batch("sentinel")
+                        stop_event.set()
+                        break
+
+                    username = bio.get("username") if isinstance(bio, dict) else "<unknown>"
+                    batch_buffer = [bio]
+                    print(
+                        f"[classifier] dequeued bio for {username} queue_size_after_get={bio_queue.qsize()}"
+                    )
+                    print(
+                        f"[classifier] batch size now {len(batch_buffer)}; usernames={[b.get('username') for b in batch_buffer]}"
+                    )
+
+                    target = ScraperConfig.CLASSIFICATION_CHUNK_SIZE
+                    deadline = loop.time() + ScraperConfig.CLASS_MAX_WAIT_SEC
+                    min_required = ScraperConfig.CLASS_MIN_CHUNK_SIZE
+
+                    saw_sentinel = False
+
+                    # Drain immediate queue contents
+                    while len(batch_buffer) < target:
                         try:
-                            await asyncio.wait_for(process_classification_batch(batch_buffer, client, criteria_text), timeout=30)
-                            print("[classifier] finished batch")
+                            nxt = bio_queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                        if nxt is None:
+                            saw_sentinel = True
+                            break
+                        batch_buffer.append(nxt)
+
+                    # Wait up to the deadline for more items
+                    while not saw_sentinel and len(batch_buffer) < target:
+                        remaining = deadline - loop.time()
+                        if remaining <= 0:
+                            break
+                        try:
+                            nxt = await asyncio.wait_for(bio_queue.get(), timeout=remaining)
                         except asyncio.TimeoutError:
-                            print("[classifier] batch timed out; skipping")
-                        finally:
-                            batch_buffer = []
+                            break
+                        if nxt is None:
+                            saw_sentinel = True
+                            break
+                        batch_buffer.append(nxt)
+
+                    full = len(batch_buffer) >= target
+                    min_ok = len(batch_buffer) >= min_required
+                    time_up = loop.time() >= deadline
+
+                    if full or saw_sentinel or time_up or min_ok:
+                        reason_parts = []
+                        if full:
+                            reason_parts.append("full")
+                        if time_up and not full:
+                            reason_parts.append("deadline")
+                        if saw_sentinel:
+                            reason_parts.append("sentinel")
+                        if not reason_parts:
+                            reason_parts.append("min")
+                        await _flush_batch("+".join(reason_parts))
+
+                        if saw_sentinel:
+                            print("[classifier] sentinel observed during coalesce; stopping")
+                            stop_event.set()
+                            break
 
             except Exception as e:
                 print(f"Bio classifier error: {e}")
@@ -719,6 +981,8 @@ class InstagramScraper:
             try:
                 # Extract just the bio text for classification
                 bio_texts = [b["bio"] for b in bios]
+                usernames = [b.get("username") for b in bios]
+                print(f"[classifier] process_classification_batch usernames={usernames}")
 
                 # Classify the batch
                 print(f"🧪 [DEBUG] process_classification_batch: size={len(bio_texts)} custom_criteria={bool(criteria_text_param and criteria_text_param.strip())}")
@@ -761,12 +1025,10 @@ class InstagramScraper:
         if user_id_val:
             tasks.append(asyncio.create_task(username_producer_api(user_id_val), name="username_producer_api"))
         else:
-            print("[api] failed to resolve user id; using scroll producer")
-            tasks.append(asyncio.create_task(username_producer_scroll(), name="username_producer_scroll"))
-        tasks.extend([
-            asyncio.create_task(bio_fetcher(), name="bio_fetcher"),
-            asyncio.create_task(bio_classifier(), name="bio_classifier"),
-        ])
+            raise RuntimeError("Unable to resolve target user id for API scraping")
+        for i, bio_page in enumerate(bio_pages):
+            tasks.append(asyncio.create_task(bio_worker(i, bio_page, followers_page.context), name=f"bio_worker_{i}"))
+        tasks.append(asyncio.create_task(bio_classifier(), name="bio_classifier"))
 
         start_time = time.perf_counter()
 
@@ -788,10 +1050,11 @@ class InstagramScraper:
             stop_event.set()
 
             # Proactively send sentinels to unblock queues in case producers/consumers are waiting
-            try:
-                username_queue.put_nowait(None)
-            except Exception:
-                pass
+            for _ in range(len(bio_pages)):
+                try:
+                    username_queue.put_nowait(None)
+                except Exception:
+                    pass
             try:
                 bio_queue.put_nowait(None)
             except Exception:
@@ -813,6 +1076,12 @@ class InstagramScraper:
                     print("[cancel] cancelled wait_task")
             except Exception:
                 pass
+
+            # Ensure latest follower cache state is persisted before saving results
+            try:
+                await _flush_followers_cache_final()
+            except Exception as exc:
+                print(f"⚠️ Failed final follower cache flush: {exc}")
 
             # Calculate elapsed time
             elapsed_time = time.perf_counter() - start_time
@@ -864,6 +1133,14 @@ class InstagramScraper:
             user_agent="Mozilla/5.0 (X11; Linux x86_64)",
             record_video_dir="videos/"
         )
+
+        async def _request_shaper(route, request):
+            resource_type = request.resource_type
+            if resource_type in {"image", "media", "font", "stylesheet"}:
+                return await route.abort()
+            return await route.continue_()
+
+        await context.route("**/*", _request_shaper)
         
         # Create pages
         followers_page = await context.new_page()
@@ -960,14 +1237,34 @@ class InstagramScraper:
         os.makedirs("shots", exist_ok=True)
         not_visible_path = "shots/not_visible.png"
         try:
-            await followers_page.screenshot(path=not_visible_path, full_page=True)
-        except PlayTimeout:
-            print("Screenshot timed out – continuing without it")
-        
-        if self.gcs_bucket:
-            self.csv_exporter.upload_to_gcs(local_path=not_visible_path, destination_blob=not_visible_path)
-        
-        await context.close()
+            if followers_page and not followers_page.is_closed():
+                await followers_page.screenshot(path=not_visible_path, full_page=True)
+            else:
+                print("[cleanup] page already closed; skipping screenshot")
+        except (PlayTimeout, PlaywrightError) as e:
+            print(f"[cleanup] screenshot skipped ({type(e).__name__}: {e})")
+
+        try:
+            if self.gcs_bucket and os.path.exists(not_visible_path):
+                self.csv_exporter.upload_to_gcs(local_path=not_visible_path, destination_blob=not_visible_path)
+        except Exception as e:
+            print(f"[cleanup] upload skip/error: {e}")
+
+        try:
+            if context:
+                is_closed_method = getattr(context, "is_closed", None)
+                should_close = True
+                if callable(is_closed_method):
+                    try:
+                        should_close = not context.is_closed()
+                    except PlaywrightError:
+                        should_close = False
+                if should_close:
+                    await context.close()
+                else:
+                    print("[cleanup] context already closed; nothing to do")
+        except PlaywrightError as e:
+            print(f"[cleanup] context close ignored ({type(e).__name__}: {e})")
 
 
 # Backward compatibility function
