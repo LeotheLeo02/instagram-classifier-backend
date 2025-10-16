@@ -44,7 +44,7 @@ class ScraperConfig:
     USERNAME_QUEUE_HIGH_WATERMARK = 8  # optional: slow down if qsize >= HIGH
 
     # Overall safety timeout for a single scrape run (seconds)
-    SCRAPE_MAX_SECONDS = 3600
+    SCRAPE_MAX_SECONDS = 7200
     
     # Instagram web API constants
     IG_APP_ID = "936619743392459"
