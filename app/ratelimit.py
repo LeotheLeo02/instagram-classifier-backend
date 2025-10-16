@@ -61,7 +61,7 @@ async def with_retry(
     *,
     limiter: RateLimiter,
     what: str,
-    max_attempts: int = 5,
+    max_attempts: Optional[int] = None,
     base_delay: float = 1.5,
     hard_penalty_factor: float = 4.0,
     hard_penalty_seconds: float = 180.0,
@@ -70,7 +70,8 @@ async def with_retry(
     on_429: Optional[Callable[[int], None]] = None,
     on_5xx: Optional[Callable[[int], None]] = None,
 ) -> T:
-    for attempt in range(max_attempts):
+    attempts = max_attempts if max_attempts is not None else 5
+    for attempt in range(attempts):
         await limiter.acquire()
         resp = await call()
         status = getattr(resp, "status", None)

@@ -66,6 +66,9 @@ class ScraperConfig:
     RATE_LIMIT_PENALTY_SOFT_SECONDS = float(os.getenv("IG_RATE_LIMIT_PENALTY_SOFT_SECONDS", "120"))
     LATENCY_SMOOTHING = float(os.getenv("IG_LATENCY_SMOOTHING", "0.2"))
 
+    # Retry limits
+    IG_RETRY_ATTEMPTS = int(os.getenv("IG_RETRY_ATTEMPTS", "3"))
+
     # Cooldown persistence
     COOLDOWN_METADATA_NAME = "cooldown.json"
     COOLDOWN_MARGIN_SECONDS = int(os.getenv("IG_COOLDOWN_MARGIN_SECONDS", "5"))

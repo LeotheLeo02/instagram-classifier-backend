@@ -314,6 +314,7 @@ class InstagramScraper:
                 ),
                 limiter=self._rl_graphql,
                 what=f"web_profile_info for {username}",
+                max_attempts=1,
                 hard_penalty_factor=ScraperConfig.RATE_LIMIT_PENALTY_FACTOR,
                 hard_penalty_seconds=ScraperConfig.RATE_LIMIT_PENALTY_SECONDS,
                 soft_penalty_factor=ScraperConfig.RATE_LIMIT_PENALTY_SOFT_FACTOR,
@@ -413,6 +414,8 @@ class InstagramScraper:
         cached_followers_page = await self._load_cached_followers_page(target)
         persisted_followers: List[str] = []
         persisted_followers_set: Set[str] = set()
+        new_followers_for_cache: List[str] = []
+        new_followers_for_cache_set: Set[str] = set()
         stored_next_cursor: Optional[str] = None
         rolling_latency: float = 0.0
 
@@ -422,8 +425,10 @@ class InstagramScraper:
                 for handle in cached_followers_page.get("followers", []) or []
                 if isinstance(handle, str) and handle.strip()
             ]
-            persisted_followers.extend(cached_list)
-            persisted_followers_set.update(cached_list)
+            for handle in cached_list:
+                if handle not in persisted_followers_set:
+                    persisted_followers.append(handle)
+                    persisted_followers_set.add(handle)
             stored_next_cursor = cached_followers_page.get("next_cursor") or None
             print(
                 f"[cache] Loaded {len(cached_list)} cached followers for @{target}"
@@ -450,13 +455,15 @@ class InstagramScraper:
             if not force and (now - followers_page_state["last_save_ts"]) < 5.0:
                 return
             try:
-                await self._save_followers_page(target, persisted_followers, stored_next_cursor)
+                combined_followers = persisted_followers + new_followers_for_cache
+                await self._save_followers_page(target, combined_followers, stored_next_cursor)
                 followers_page_state["dirty"] = False
                 followers_page_state["last_save_ts"] = now
             except Exception as exc:
                 print(f"⚠️ Failed to persist followers page for {target}: {exc}")
             else:
-                print(f"[cache] persisted {len(persisted_followers)} cached followers for @{target} cursor={'set' if stored_next_cursor else 'none'}")
+                total_cached = len(persisted_followers) + len(new_followers_for_cache)
+                print(f"[cache] persisted {total_cached} cached followers for @{target} cursor={'set' if stored_next_cursor else 'none'}")
 
         async def _flush_followers_cache_final() -> None:
             await persist_followers_page_if_needed(force=True)
@@ -546,6 +553,7 @@ class InstagramScraper:
                     ),
                     limiter=self._rl_graphql,
                     what=f"web_profile_info for {username}",
+                    max_attempts=ScraperConfig.IG_RETRY_ATTEMPTS,
                     hard_penalty_factor=ScraperConfig.RATE_LIMIT_PENALTY_FACTOR,
                     hard_penalty_seconds=ScraperConfig.RATE_LIMIT_PENALTY_SECONDS,
                     soft_penalty_factor=ScraperConfig.RATE_LIMIT_PENALTY_SOFT_FACTOR,
@@ -706,6 +714,7 @@ class InstagramScraper:
                             ),
                             limiter=self._rl_graphql,
                             what="GraphQL followers page",
+                            max_attempts=ScraperConfig.IG_RETRY_ATTEMPTS,
                             hard_penalty_factor=ScraperConfig.RATE_LIMIT_PENALTY_FACTOR,
                             hard_penalty_seconds=ScraperConfig.RATE_LIMIT_PENALTY_SECONDS,
                             soft_penalty_factor=ScraperConfig.RATE_LIMIT_PENALTY_SOFT_FACTOR,
@@ -765,10 +774,15 @@ class InstagramScraper:
                         username_val = node.get("username")
                         if username_val and username_val not in seen_handles:
                             seen_handles.add(username_val)
-                            if username_val not in persisted_followers_set:
-                                persisted_followers.append(username_val)
-                                persisted_followers_set.add(username_val)
+                            if (
+                                username_val not in persisted_followers_set
+                                and username_val not in new_followers_for_cache_set
+                            ):
+                                new_followers_for_cache.append(username_val)
+                                new_followers_for_cache_set.add(username_val)
                                 followers_page_state["dirty"] = True
+                            if username_val not in persisted_followers_set:
+                                persisted_followers_set.add(username_val)
                             buffered_usernames.append(username_val)
 
                     if not page_info.get("has_next_page") or not page_info.get("end_cursor"):
